@@ -1441,17 +1441,13 @@ function FormsDashboard() {
   );
 
   // All appointments (used to count test-ride bookings in the analytics tab).
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .listAllAppointments()
-      .then((res) => {
-        if (!cancelled) setAnalyticsAppointments(res.data ?? []);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+  const loadAppointments = useCallback(async () => {
+    try {
+      const res = await api.listAllAppointments();
+      setAnalyticsAppointments(res.data ?? []);
+    } catch {
+      /* keep the last known appointments so the chart does not blank out */
+    }
   }, []);
 
   // Forms that have at least one real submission (from the DB) power the filter
@@ -1581,9 +1577,28 @@ function FormsDashboard() {
     }
   }, []);
 
+  /** Reload every dataset the analytics tab is derived from. */
+  const refreshAnalytics = useCallback(async () => {
+    await Promise.all([loadSubmissions(), loadAppointments()]);
+  }, [loadSubmissions, loadAppointments]);
+
   useEffect(() => {
-    loadSubmissions();
-  }, [loadSubmissions]);
+    refreshAnalytics();
+  }, [refreshAnalytics]);
+
+  // Submissions usually arrive from the public form in another tab, so nothing
+  // notifies this page. Re-pull whenever the user comes back to this window.
+  useEffect(() => {
+    const revalidate = () => {
+      if (document.visibilityState === 'visible') void refreshAnalytics();
+    };
+    window.addEventListener('focus', revalidate);
+    document.addEventListener('visibilitychange', revalidate);
+    return () => {
+      window.removeEventListener('focus', revalidate);
+      document.removeEventListener('visibilitychange', revalidate);
+    };
+  }, [refreshAnalytics]);
 
   // Rebuild the visible columns whenever the selected form changes.
   useEffect(() => {
@@ -2581,6 +2596,19 @@ function FormsDashboard() {
                           </button>
                         ))}
                       </div>
+                      <button
+                        onClick={() => {
+                          refreshAnalytics();
+                          triggerToast('Analytics refreshed');
+                        }}
+                        disabled={submissionLoading}
+                        className="p-1.5 border border-slate-300 text-slate-600 hover:bg-slate-50 rounded-md text-xs shadow-xs transition disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Refresh analytics"
+                      >
+                        <FaRotate
+                          className={`text-slate-500 text-xs ${submissionLoading ? 'animate-spin' : ''}`}
+                        />
+                      </button>
                     </div>
                   </div>
 
