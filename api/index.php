@@ -4658,23 +4658,18 @@ switch ($resource) {
         }
         break;
 
-    case 'health':
+case 'health':
         // Reachable without a session, so it must not disclose infrastructure:
-        // only "is the app alive", never DB credentials, hosts or row counts.
+        // only "is the app alive". No PHP version, no DB host/user, no row
+        // counts, no file paths and no exception text.
         $info = [
             'status' => 'ok',
-            'php' => PHP_VERSION,
         ];
-// New account only (an existing address returned above).
-    $plain = generate_strong_password();
-    $hash = hash_password($plain);
-
-    try {
-            $pdo = db();
-            $pdo->query('SELECT 1');
-            $info['db_status'] = 'connected';
+        try {
+            db()->query('SELECT 1');
+            $info['database'] = 'ok';
         } catch (Throwable $e) {
-            $info['db_status'] = 'error';
+            $info['database'] = 'unavailable';
         }
         respond($info);
         break;
