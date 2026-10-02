@@ -213,6 +213,19 @@ export interface SmartFormInput {
   campaign_id?: number | null;
 }
 
+/**
+ * Per-invoice editable overrides. `text` holds edited copy for every
+ * free-text node on the sheet keyed by field id; the three amount keys hold a
+ * manual replacement for the calculated figure, and an empty value means
+ * "calculate automatically".
+ */
+export interface InvoiceContent {
+  text?: Record<string, string>;
+  totalExcl?: string;
+  taxPayable?: string;
+  totalIncl?: string;
+}
+
 /** Saved sales tax invoice row (GET /invoices). */
 export interface ApiInvoice {
   id: number;
@@ -231,6 +244,7 @@ export interface ApiInvoice {
   tax_rate: number;
   tax_payable: number;
   value_incl: number;
+  content?: InvoiceContent | null;
   created_by: number | null;
   created_at: string | null;
   updated_at: string | null;
@@ -253,6 +267,7 @@ export interface InvoiceInput {
   tax_rate?: number;
   tax_payable?: number;
   value_incl?: number;
+  content?: InvoiceContent | null;
   created_by?: number | null;
 }
 

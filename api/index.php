@@ -3012,6 +3012,20 @@ function ensure_invoices_table(): void
     if ((int)$col->fetchColumn() === 0) {
         db()->exec('ALTER TABLE invoices ADD COLUMN address VARCHAR(255) DEFAULT "" AFTER strn');
     }
+
+    // Per-invoice editable copy + manual amount overrides. One JSON column
+    // covers every free-text node on the sheet and the three computed totals,
+    // so making the whole document editable needs no further migrations.
+    $col2 = db()->prepare(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME   = 'invoices'
+            AND COLUMN_NAME  = 'content'"
+    );
+    $col2->execute();
+    if ((int)$col2->fetchColumn() === 0) {
+        db()->exec('ALTER TABLE invoices ADD COLUMN content MEDIUMTEXT NULL AFTER value_incl');
+    }
 }
 
 /** Cast an invoice row's numeric columns for the API response. */
@@ -3023,6 +3037,7 @@ function invoice_payload(array $row): array
     foreach (['value_excl', 'tax_rate', 'tax_payable', 'value_incl'] as $k) {
         $row[$k] = (float)$row[$k];
     }
+    $row['content'] = decode_json_field($row['content'] ?? null);
     $row['created_by'] = isset($row['created_by']) && $row['created_by'] !== null ? (int)$row['created_by'] : null;
     return $row;
 }
@@ -3110,6 +3125,7 @@ function invoice_columns(array $body): array
         'tax_rate' => $num($body['tax_rate'] ?? 0),
         'tax_payable' => $num($body['tax_payable'] ?? 0),
         'value_incl' => $num($body['value_incl'] ?? 0),
+        'content' => encode_json_field($body['content'] ?? null),
     ];
 }
 
@@ -3132,9 +3148,9 @@ function create_invoice(array $body): void
     $stmt = db()->prepare(
         'INSERT INTO invoices (invoice_no, dated, strn, address, customer_name, qty, motorcycle, model_year,
                                colour, engine_no, chassis_no, value_excl, tax_rate, tax_payable,
-                               value_incl, created_by)
+                               value_incl, content, created_by)
          VALUES (:no, :dated, :strn, :address, :cust, :qty, :moto, :year, :colour, :engine, :chassis,
-                 :vexcl, :rate, :tpay, :vincl, :created_by)'
+                 :vexcl, :rate, :tpay, :vincl, :content, :created_by)'
     );
     $stmt->execute([
         ':no' => $c['invoice_no'],
@@ -3152,6 +3168,7 @@ function create_invoice(array $body): void
         ':rate' => $c['tax_rate'],
         ':tpay' => $c['tax_payable'],
         ':vincl' => $c['value_incl'],
+        ':content' => $c['content'],
         ':created_by' => $createdBy,
     ]);
     $id = (int)db()->lastInsertId();
@@ -3183,7 +3200,7 @@ function update_invoice(int $id, array $body): void
         'UPDATE invoices SET invoice_no = :no, dated = :dated, strn = :strn, address = :address,
                 customer_name = :cust, qty = :qty, motorcycle = :moto, model_year = :year, colour = :colour,
                 engine_no = :engine, chassis_no = :chassis, value_excl = :vexcl, tax_rate = :rate,
-                tax_payable = :tpay, value_incl = :vincl
+                tax_payable = :tpay, value_incl = :vincl, content = :content
           WHERE id = :id'
     )->execute([
         ':no' => $c['invoice_no'],
@@ -3201,6 +3218,7 @@ function update_invoice(int $id, array $body): void
         ':rate' => $c['tax_rate'],
         ':tpay' => $c['tax_payable'],
         ':vincl' => $c['value_incl'],
+        ':content' => $c['content'],
         ':id' => $id,
     ]);
 

@@ -14,7 +14,7 @@ import {
   FaPalette,
   FaMotorcycle,
 } from 'react-icons/fa6';
-import { api, type ApiInvoice, type InvoiceInput } from '../api';
+import { api, type ApiInvoice, type InvoiceContent, type InvoiceInput } from '../api';
 import { useAuth } from '../auth';
 import YadeaLogo from './YadeaLogo';
 
@@ -35,9 +35,104 @@ function formatMoney(amount: number): string {
   });
 }
 
+/**
+ * True when a stored amount override exists and is genuinely different from
+ * the calculated figure. Rows written before amounts were overridable just
+ * carry the calculated total, so comparing on load keeps them auto-calculating
+ * instead of freezing the number they happened to save.
+ */
+function differsFromCalc(stored: string | null | undefined, calc: number): boolean {
+  if (typeof stored !== 'string' || stored.trim() === '') return false;
+  return Math.abs(parseNum(stored) - calc) > 0.005;
+}
+
 function todayDMY(): string {
   const d = new Date();
   return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+}
+
+/* ----------------------- inline-editable text node ----------------------- */
+
+/**
+ * A text node on the invoice sheet that can be edited in place.
+ *
+ * Uses contentEditable rather than an <input> so it sizes to its own content
+ * and prints with its inherited typography instead of a form-control box.
+ * The node is only re-synced from props while it is NOT focused, otherwise
+ * React would reset the caret on every keystroke.
+ */
+function EditableText({
+  value,
+  onChange,
+  className = '',
+  style,
+  ariaLabel,
+  title,
+  placeholder,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  className?: string;
+  style?: React.CSSProperties;
+  ariaLabel?: string;
+  title?: string;
+  placeholder?: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const focused = useRef(false);
+  const shown = useRef(value);
+
+  // Adopt a new value only when the node is idle, so typing is never clobbered.
+  useEffect(() => {
+    if (focused.current) return;
+    if (shown.current === value) return;
+    shown.current = value;
+    if (ref.current) ref.current.innerText = value;
+  }, [value]);
+
+  // Restore the initial/default copy if this node mounts empty.
+  useEffect(() => {
+    if (ref.current && !ref.current.innerText && value) {
+      shown.current = value;
+      ref.current.innerText = value;
+    }
+    // Mount only — later syncing is handled by the effect above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div
+      ref={ref}
+      contentEditable
+      suppressContentEditableWarning
+      spellCheck={false}
+      role="textbox"
+      tabIndex={0}
+      aria-label={ariaLabel}
+      title={title}
+      data-placeholder={placeholder}
+      className={`inv-editable ${className}`}
+      style={style}
+      onFocus={() => {
+        focused.current = true;
+      }}
+      onBlur={() => {
+        focused.current = false;
+        const next = (ref.current?.innerText ?? '').replace(/ /g, ' ').trim();
+        shown.current = next;
+        onChange(next);
+      }}
+      onKeyDown={(e) => {
+        // Enter commits instead of inserting a newline; Shift+Enter still allows one.
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          (e.currentTarget as HTMLElement).blur();
+        }
+        // Keep the sheet's drag/select canvas from swallowing the keystroke.
+        e.stopPropagation();
+      }}
+    />
+  );
 }
 
 /* --------------------- dashboard history filters --------------------- */
@@ -161,6 +256,49 @@ function emptyFormWithDefaults(): InvoiceFormState {
   return { ...EMPTY_FORM, dated: todayDMY() };
 }
 
+/**
+ * Shipped wording for every text node on the sheet. Keeping the defaults in one
+ * place means a text node stores an override only when it actually differs, so
+ * invoices created before a wording change still follow the current copy.
+ */
+const DEFAULT_TEXT: Record<string, string> = {
+  brandText: 'Yadea',
+  titleText: 'Invoice',
+  labelInvoiceNo: 'Invoice No',
+  labelInvoiceDate: 'Invoice Date',
+  labelInvoiceTo: 'Invoice To:',
+  labelInvoiceFrom: 'Invoice From:',
+  sellerName: 'Yadea Hussain Motors',
+  labelStrn: 'STRN Number:',
+  labelValueExclTax: 'Value Excl. Tax:',
+  labelTaxRate: 'Sales Tax Rate:',
+  labelTotalInclTax: 'Total Incl. Tax:',
+  thQty: 'Qty',
+  thDescription: 'Description',
+  thValueExcl: 'Value Excl. Sales Tax',
+  thTaxRate: 'Tax Rate',
+  thSalesTaxPayable: 'Sales Tax Payable',
+  thValueIncl: 'Value Incl. Tax',
+  rowTotal: 'TOTAL',
+  lblMotorcycle: 'Motorcycle',
+  lblYear: 'M/Year',
+  lblColor: 'Colur',
+  lblEngine: 'Engine#',
+  lblChasis: 'Chasis',
+  labelTermsHeading: 'Terms and Conditions:',
+  term1Num: '1.',
+  term2Num: '2.',
+  term1: 'Payment is due in full at the time of delivery of the vehicle.',
+  term2: 'Warranty and service claims are processed as per official Yadea Hussain Motors policy.',
+  labelTotalsValueExcl: 'Value Excl. Tax:',
+  labelTotalsTaxPayable: 'Sales Tax Payable:',
+  labelTotalPayable: 'Total Payable:',
+  labelForOnBehalfOf: 'For & on Behalf of',
+  signatureName: 'Yadea Hussain Motors',
+  labelSignature: 'Signature',
+  currencyText: 'Rs',
+};
+
 /* ----------------------- invoice design studio ------------------------- */
 
 /** Per-element Canva-style overrides: position nudge, scale, colours, size. */
@@ -275,12 +413,12 @@ function loadHtml2Pdf(): Promise<Html2PdfApi> {
 
 /* ------------------------------- icons ------------------------------ */
 
-const DESC_ROWS: { key: keyof InvoiceFormState; label: string; placeholder: string }[] = [
-  { key: 'motorcycle', label: 'Motorcycle', placeholder: 'e.g. Yadea T9 Electric Scooter' },
-  { key: 'year', label: 'M/Year', placeholder: '2026' },
-  { key: 'color', label: 'Colur', placeholder: 'Grey / Red' },
-  { key: 'engine', label: 'Engine#', placeholder: 'Engine No.' },
-  { key: 'chassis', label: 'Chasis', placeholder: 'Chassis No.' },
+const DESC_ROWS: { key: keyof InvoiceFormState; textKey: string; placeholder: string }[] = [
+  { key: 'motorcycle', textKey: 'lblMotorcycle', placeholder: 'e.g. Yadea T9 Electric Scooter' },
+  { key: 'year', textKey: 'lblYear', placeholder: '2026' },
+  { key: 'color', textKey: 'lblColor', placeholder: 'Grey / Red' },
+  { key: 'engine', textKey: 'lblEngine', placeholder: 'Engine No.' },
+  { key: 'chassis', textKey: 'lblChasis', placeholder: 'Chassis No.' },
 ];
 
 /* ================================ page ============================== */
@@ -296,6 +434,7 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
   const canExport = hasActionPermission('invoices', 'Invoices', 'export');
 
   const [form, setForm] = useState<InvoiceFormState>(emptyFormWithDefaults);
+  const [content, setContent] = useState<InvoiceContent>({});
   const [design, setDesign] = useState<InvoiceDesign>(() => loadDesign(user?.id));
   const [designOpen, setDesignOpen] = useState(true);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -455,9 +594,66 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
   const qtyNum = parseNum(form.qty) || 1;
   const valueExcl = parseNum(form.valueExcl);
   const taxRate = parseNum(form.taxRate);
-  const totalExcl = valueExcl * qtyNum;
-  const taxPayable = totalExcl * (taxRate / 100);
-  const totalIncl = totalExcl + taxPayable;
+  const calcTotalExcl = valueExcl * qtyNum;
+  const calcTaxPayable = calcTotalExcl * (taxRate / 100);
+  const calcTotalIncl = calcTotalExcl + calcTaxPayable;
+
+  /* --------- editable copy + manual amount overrides --------- */
+
+  /** A blank/absent override means "work it out from the line values". */
+  const hasOverride = (v?: string) => typeof v === 'string' && v.trim() !== '';
+
+  const totalExcl = hasOverride(content.totalExcl) ? parseNum(content.totalExcl) : calcTotalExcl;
+  const taxPayable = hasOverride(content.taxPayable) ? parseNum(content.taxPayable) : calcTaxPayable;
+  const totalIncl = hasOverride(content.totalIncl) ? parseNum(content.totalIncl) : calcTotalIncl;
+
+  const setOverride = (key: 'totalExcl' | 'taxPayable' | 'totalIncl', raw: string) =>
+    setContent((c) => ({ ...c, [key]: raw.trim() === '' ? '' : raw.trim() }));
+
+  /** Edited copy for a sheet text node, falling back to the shipped wording. */
+  const txt = (key: string) => content.text?.[key] ?? DEFAULT_TEXT[key] ?? '';
+
+  const setTxt = (key: string, value: string) =>
+    setContent((c) => ({
+      ...c,
+      text: { ...(c.text ?? {}), [key]: value === DEFAULT_TEXT[key] ? '' : value },
+    }));
+
+  const resetAmounts = () =>
+    setContent((c) => ({ ...c, totalExcl: '', taxPayable: '', totalIncl: '' }));
+
+  const amountOverridden = hasOverride(content.totalExcl) || hasOverride(content.taxPayable) || hasOverride(content.totalIncl);
+
+  /** The "Rs"-style currency prefix shown before each total. */
+  const currencyEl = (
+    <EditableText
+      value={txt('currencyText')}
+      onChange={(v) => setTxt('currencyText', v)}
+      ariaLabel="Currency prefix"
+      title="Currency prefix"
+    />
+  );
+
+  /**
+   * An amount on the sheet. Shows the effective figure (manual override when
+   * one is set, otherwise the calculated value) and stores whatever is typed;
+   * clearing the text drops the override and returns to calculating.
+   */
+  const moneyNode = (
+    key: 'totalExcl' | 'taxPayable' | 'totalIncl',
+    effective: number,
+    auto: number,
+    className = '',
+    ariaLabel = 'Amount'
+  ) => (
+    <EditableText
+      value={formatMoney(effective)}
+      onChange={(raw) => setOverride(key, raw === formatMoney(auto) ? '' : raw)}
+      className={`text-right ${className}`}
+      ariaLabel={`${ariaLabel} (click to type a custom figure, clear it to calculate automatically)`}
+      title="Click to type a custom figure. Clear the field to calculate it automatically."
+    />
+  );
 
   /* ----------------------- dashboard derivations ---------------------- */
 
@@ -521,6 +717,7 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
     setEditingId(null);
     setView('editor');
     setForm(emptyFormWithDefaults());
+    setContent({});
     api
       .nextInvoiceNumber()
       .then((res) => setForm((prev) => ({ ...prev, invoiceNo: res.data.invoice_no })))
@@ -543,6 +740,12 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
     tax_rate: taxRate,
     tax_payable: Math.round(taxPayable * 100) / 100,
     value_incl: Math.round(totalIncl * 100) / 100,
+    content: {
+      ...(Object.keys(content.text ?? {}).length ? { text: content.text } : {}),
+      totalExcl: content.totalExcl ?? '',
+      taxPayable: content.taxPayable ?? '',
+      totalIncl: content.totalIncl ?? '',
+    },
     created_by: user?.id ?? null,
   });
 
@@ -592,6 +795,21 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
       chassis: inv.chassis_no ?? '',
       valueExcl: String(inv.value_excl ?? 0),
       taxRate: String(inv.tax_rate ?? 18),
+    });
+    setContent({
+      ...(inv.content?.text ? { text: inv.content.text } : {}),
+      // Only treat a stored amount as an override when it differs from what the
+      // line values work out to, so older rows that stored plain totals keep
+      // calculating automatically.
+      totalExcl: differsFromCalc(inv.content?.totalExcl, inv.value_excl * (Number(inv.qty) || 1))
+        ? inv.content?.totalExcl ?? ''
+        : '',
+      taxPayable: differsFromCalc(inv.content?.taxPayable, inv.tax_payable)
+        ? inv.content?.taxPayable ?? ''
+        : '',
+      totalIncl: differsFromCalc(inv.content?.totalIncl, inv.value_incl)
+        ? inv.content?.totalIncl ?? ''
+        : '',
     });
     onNotify(`Loaded invoice "${inv.invoice_no}"`);
   };
@@ -723,7 +941,12 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
           className="leading-none font-black uppercase tracking-[0.05em] mt-1.5"
           style={{ fontSize: design.brandTextSize, color: elO('lockup').colorA ?? design.brandTextColor }}
         >
-          Yadea
+          <EditableText
+            value={txt('brandText')}
+            onChange={(v) => setTxt('brandText', v)}
+            ariaLabel="Brand name"
+            className="inv-editable-strong"
+          />
         </span>
       </div>
       <Handles id="lockup" />
@@ -748,7 +971,11 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
           letterSpacing: '0.03em',
         }}
       >
-        Invoice
+        <EditableText
+          value={txt('titleText')}
+          onChange={(v) => setTxt('titleText', v)}
+          ariaLabel="Document title"
+        />
       </h1>
       <div
         className={`${tAlign === 'right' ? 'ml-auto' : ''} mt-1.5 h-[3px] w-20 rounded-full`}
@@ -757,7 +984,11 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
       <div className="mt-3 space-y-2.5">
         <div className={`flex items-center gap-2 ${tAlign === 'right' ? 'justify-end' : 'justify-start'}`}>
           <span className="text-[8.5px] font-bold tracking-[0.18em] uppercase text-white/70 whitespace-nowrap">
-            Invoice No
+            <EditableText
+              value={txt('labelInvoiceNo')}
+              onChange={(v) => setTxt('labelInvoiceNo', v)}
+              ariaLabel="Invoice number label"
+            />
           </span>
           <input
             type="text"
@@ -769,7 +1000,11 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
         </div>
         <div className={`flex items-center gap-2 ${tAlign === 'right' ? 'justify-end' : 'justify-start'}`}>
           <span className="text-[8.5px] font-bold tracking-[0.18em] uppercase text-white/70 whitespace-nowrap">
-            Invoice Date
+            <EditableText
+              value={txt('labelInvoiceDate')}
+              onChange={(v) => setTxt('labelInvoiceDate', v)}
+              ariaLabel="Invoice date label"
+            />
           </span>
           <input
             type="text"
@@ -805,12 +1040,46 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
         .inv-table td { border-right: 1.5px solid #111827; border-bottom: 1.5px solid #111827; padding: 6px 4px; vertical-align: top; }
         .inv-table th:last-child, .inv-table td:last-child { border-right: none; }
         .inv-table tr.inv-total-row td { border-bottom: none; border-top: 2px solid #111827; background: #fff; }
+        .inv-editable {
+          min-width: 4px;
+          display: inline-block;
+          max-width: 100%;
+          outline: none;
+          border-bottom: 1.5px dashed transparent;
+          border-radius: 3px;
+          cursor: text;
+          white-space: pre-wrap;
+          word-break: break-word;
+        }
+        .inv-editable:hover { border-bottom-color: rgba(100, 116, 139, 0.5); }
+        .inv-editable:focus {
+          border-bottom-color: #EB5F1B;
+          background-color: rgba(254, 243, 199, 0.45);
+        }
+        .inv-editable:empty::before {
+          content: attr(data-placeholder);
+          opacity: 0.45;
+        }
+        .inv-editable-strong { font-weight: 900; }
+        .inv-editable-hint {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.35rem;
+          font-size: 11px;
+          font-weight: 700;
+          color: #B45309;
+          background: #FEF3C7;
+          border: 1px solid #FDE68A;
+          border-radius: 999px;
+          padding: 0.15rem 0.6rem;
+        }
         @media print {
           body.inv-printing * { visibility: hidden !important; }
           body.inv-printing .inv-page, body.inv-printing .inv-page * { visibility: visible !important; }
           body.inv-printing .inv-scroll-host { overflow: visible !important; padding: 0 !important; }
           body.inv-printing .inv-page { position: absolute; left: 0; top: 0; width: 100% !important; min-width: 0 !important; border: none !important; box-shadow: none !important; border-radius: 0 !important; }
           body.inv-printing input { border: none !important; box-shadow: none !important; background: transparent !important; }
+          body.inv-printing .inv-editable { border-bottom-color: transparent !important; background: transparent !important; }
           .inv-selected { outline: none !important; }
           .inv-ui { display: none !important; }
         }
@@ -889,6 +1158,17 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                     <FaFilePdf className={`text-yadea-orange ${pdfBusy ? 'animate-pulse' : ''}`} />
                     {pdfBusy ? 'Preparing...' : 'Download PDF'}
                   </button>
+                  {amountOverridden && (
+                    <button
+                      type="button"
+                      onClick={resetAmounts}
+                      title="Clear the manual totals and calculate Value Excl. / Sales Tax / Total from the line values again"
+                      className="inv-editable-hint"
+                    >
+                      <FaRotateRight className="text-[10px]" />
+                      Totals are set manually — reset
+                    </button>
+                  )}
                 </>
               )}
             </div>
@@ -1556,7 +1836,11 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                             className="font-extrabold text-[13px] mb-1"
                             style={{ color: elO('infoCols').colorA || '#0f172a' }}
                           >
-                            Invoice To:
+                            <EditableText
+                              value={txt('labelInvoiceTo')}
+                              onChange={(v) => setTxt('labelInvoiceTo', v)}
+                              ariaLabel="Buyer column heading"
+                            />
                           </h3>
                           <input
                             type="text"
@@ -1574,9 +1858,19 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                             className="font-extrabold text-[13px] mb-1"
                             style={{ color: elO('infoCols').colorA || '#0f172a' }}
                           >
-                            Invoice From:
+                            <EditableText
+                              value={txt('labelInvoiceFrom')}
+                              onChange={(v) => setTxt('labelInvoiceFrom', v)}
+                              ariaLabel="Seller column heading"
+                            />
                           </h3>
-                          <p className="font-bold text-slate-800">Yadea Hussain Motors</p>
+                          <p className="font-bold text-slate-800">
+                            <EditableText
+                              value={txt('sellerName')}
+                              onChange={(v) => setTxt('sellerName', v)}
+                              ariaLabel="Seller name"
+                            />
+                          </p>
                           <input
                             type="text"
                             placeholder="Shop address"
@@ -1586,7 +1880,13 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                             aria-label="Seller address"
                           />
                           <p className="text-slate-700 font-bold flex items-center gap-1 flex-wrap">
-                            <span>STRN Number:</span>
+                            <span>
+                              <EditableText
+                                value={txt('labelStrn')}
+                                onChange={(v) => setTxt('labelStrn', v)}
+                                ariaLabel="STRN label"
+                              />
+                            </span>
                             <input
                               type="text"
                               value={form.strn}
@@ -1600,16 +1900,42 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                         {/* Column 3: live amounts summary */}
                         <div className="col-span-4 pl-3 border-l-2 border-slate-700 flex flex-col justify-start space-y-1">
                           <div className="flex justify-between items-center pr-1 gap-2">
-                            <span className="font-extrabold text-slate-900">Value Excl. Tax:</span>
-                            <span className="font-semibold text-slate-800 whitespace-nowrap">Rs {formatMoney(totalExcl)}</span>
+                            <span className="font-extrabold text-slate-900">
+                              <EditableText
+                                value={txt('labelValueExclTax')}
+                                onChange={(v) => setTxt('labelValueExclTax', v)}
+                                ariaLabel="Value excluding tax label"
+                              />
+                            </span>
+                            {moneyNode('totalExcl', totalExcl, calcTotalExcl, 'font-semibold text-slate-800', 'Value excluding tax')}
                           </div>
                           <div className="flex justify-between items-center pr-1 gap-2">
-                            <span className="font-extrabold text-slate-900">Sales Tax Rate:</span>
-                            <span className="font-semibold text-slate-800 whitespace-nowrap">{form.taxRate || 0}%</span>
+                            <span className="font-extrabold text-slate-900">
+                              <EditableText
+                                value={txt('labelTaxRate')}
+                                onChange={(v) => setTxt('labelTaxRate', v)}
+                                ariaLabel="Sales tax rate label"
+                              />
+                            </span>
+                            <span className="font-semibold text-slate-800 whitespace-nowrap flex items-baseline justify-end gap-0.5">
+                              <EditableText
+                                value={`${form.taxRate || 0}`}
+                                onChange={(v) => setForm((f) => ({ ...f, taxRate: v }))}
+                                ariaLabel="Sales tax rate (click to edit)"
+                                title="Click to type a different rate, e.g. 18"
+                              />
+                              %
+                            </span>
                           </div>
                           <div className="flex justify-between items-center pr-1 gap-2">
-                            <span className="font-extrabold text-slate-900">Total Incl. Tax:</span>
-                            <span className="font-semibold text-slate-800 whitespace-nowrap">Rs {formatMoney(totalIncl)}</span>
+                            <span className="font-extrabold text-slate-900">
+                              <EditableText
+                                value={txt('labelTotalInclTax')}
+                                onChange={(v) => setTxt('labelTotalInclTax', v)}
+                                ariaLabel="Total including tax label"
+                              />
+                            </span>
+                            {moneyNode('totalIncl', totalIncl, calcTotalIncl, 'font-semibold text-slate-800', 'Total including tax')}
                           </div>
                         </div>
                       </div>
@@ -1633,23 +1959,47 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                             } text-white px-6 py-2.5 flex items-center text-[10px] sm:text-[11px] font-extrabold tracking-wider uppercase`}
                             style={{ backgroundColor: elO('itemsTable').colorA ?? design.darkColor }}
                           >
-                            <div className="w-[8%] text-center">Qty</div>
-                            <div className="w-[36%] pl-2 text-left">Description</div>
-                            <div className="w-[14%] text-center leading-tight">
-                              Value Excl.
-                              <br />
-                              Sales Tax
+                            <div className="w-[8%] text-center px-1">
+                              <EditableText
+                                value={txt('thQty')}
+                                onChange={(v) => setTxt('thQty', v)}
+                                ariaLabel="Quantity column heading"
+                              />
                             </div>
-                            <div className="w-[12%] text-center leading-tight">Tax Rate</div>
-                            <div className="w-[14%] text-center leading-tight">
-                              Sales Tax
-                              <br />
-                              Payable
+                            <div className="w-[36%] pl-2 text-left px-1">
+                              <EditableText
+                                value={txt('thDescription')}
+                                onChange={(v) => setTxt('thDescription', v)}
+                                ariaLabel="Description column heading"
+                              />
                             </div>
-                            <div className="w-[16%] text-right leading-tight pr-1">
-                              Value Incl.
-                              <br />
-                              Tax
+                            <div className="w-[14%] text-center px-1">
+                              <EditableText
+                                value={txt('thValueExcl')}
+                                onChange={(v) => setTxt('thValueExcl', v)}
+                                ariaLabel="Value excluding sales tax column heading"
+                              />
+                            </div>
+                            <div className="w-[12%] text-center px-1">
+                              <EditableText
+                                value={txt('thTaxRate')}
+                                onChange={(v) => setTxt('thTaxRate', v)}
+                                ariaLabel="Tax rate column heading"
+                              />
+                            </div>
+                            <div className="w-[14%] text-right px-1 pr-1">
+                              <EditableText
+                                value={txt('thSalesTaxPayable')}
+                                onChange={(v) => setTxt('thSalesTaxPayable', v)}
+                                ariaLabel="Sales tax payable column heading"
+                              />
+                            </div>
+                            <div className="w-[16%] text-right pr-1 px-1">
+                              <EditableText
+                                value={txt('thValueIncl')}
+                                onChange={(v) => setTxt('thValueIncl', v)}
+                                ariaLabel="Value including tax column heading"
+                              />
                             </div>
                           </div>
 
@@ -1671,14 +2021,20 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                               <div className="w-[36%] px-2 space-y-3 text-xs">
                                 {DESC_ROWS.map((row) => (
                                   <div key={row.key} className="flex items-center gap-1">
-                                    <span className="w-20 font-bold text-slate-900 shrink-0">{row.label}</span>
+                                    <span className="w-20 font-bold text-slate-900 shrink-0">
+                                      <EditableText
+                                        value={txt(row.textKey)}
+                                        onChange={(v) => setTxt(row.textKey, v)}
+                                        ariaLabel={`${row.textKey} label`}
+                                      />
+                                    </span>
                                     <input
                                       type="text"
                                       placeholder={row.placeholder}
                                       value={form[row.key]}
                                       onChange={setField(row.key)}
                                       className="inv-dotted flex-1 px-1 py-0 font-medium"
-                                      aria-label={row.label}
+                                      aria-label={row.textKey}
                                     />
                                   </div>
                                 ))}
@@ -1703,8 +2059,12 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                                   aria-label="Rate of sales tax"
                                 />
                               </div>
-                              <div className="w-[14%] text-right pt-3 px-1">{formatMoney(taxPayable)}</div>
-                              <div className="w-[16%] text-right pt-3 pr-1 font-black">{formatMoney(totalIncl)}</div>
+                              <div className="w-[14%] text-right pt-3 px-1">
+                                {moneyNode('taxPayable', taxPayable, calcTaxPayable, 'font-bold', 'Sales tax payable')}
+                              </div>
+                              <div className="w-[16%] text-right pt-3 px-1 pr-1 font-black">
+                                {moneyNode('totalIncl', totalIncl, calcTotalIncl, 'font-black', 'Value including tax')}
+                              </div>
                             </div>
 
                             {/* Total row */}
@@ -1712,15 +2072,25 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                               className="py-2.5 px-6 flex items-center justify-between border-b-2"
                               style={{ borderColor: elO('itemsTable').colorB ?? design.accentColor }}
                             >
-                              <div className="w-[44%] text-left font-extrabold tracking-wide">TOTAL</div>
-                              <div className="w-[14%] text-right font-extrabold">{formatMoney(totalExcl)}</div>
+                              <div className="w-[44%] text-left font-extrabold tracking-wide px-1">
+                                <EditableText
+                                  value={txt('rowTotal')}
+                                  onChange={(v) => setTxt('rowTotal', v)}
+                                  ariaLabel="Total row label"
+                                />
+                              </div>
+                              <div className="w-[14%] text-right font-extrabold px-1">
+                                {moneyNode('totalExcl', totalExcl, calcTotalExcl, 'font-extrabold', 'Total value excluding tax')}
+                              </div>
                               <div className="w-[12%] text-center" />
-                              <div className="w-[14%] text-right font-extrabold">{formatMoney(taxPayable)}</div>
+                              <div className="w-[14%] text-right font-extrabold px-1">
+                                {moneyNode('taxPayable', taxPayable, calcTaxPayable, 'font-extrabold', 'Total sales tax payable')}
+                              </div>
                               <div
-                                className="w-[16%] text-right pr-1 font-black text-base"
+                                className="w-[16%] text-right pr-1 font-black text-base px-1"
                                 style={{ color: elO('itemsTable').colorB ?? design.accentColor }}
                               >
-                                {formatMoney(totalIncl)}
+                                {moneyNode('totalIncl', totalIncl, calcTotalIncl, 'font-black text-base', 'Total value including tax')}
                               </div>
                             </div>
                           </div>
@@ -1743,17 +2113,48 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                               }}
                             >
                               <Handles id="termsBlock" />
-                              <h4 className="font-extrabold text-[13px] mb-2" style={{ color: elO('termsBlock').colorA || '#0f172a' }}>
-                                Terms and Conditions:
+                              <h4
+                                className="font-extrabold text-[13px] mb-2"
+                                style={{ color: elO('termsBlock').colorA || '#0f172a' }}
+                              >
+                                <EditableText
+                                  value={txt('labelTermsHeading')}
+                                  onChange={(v) => setTxt('labelTermsHeading', v)}
+                                  ariaLabel="Terms heading"
+                                />
                               </h4>
                               <ol className="space-y-1 font-semibold text-slate-700 leading-relaxed list-none p-0 m-0">
                                 <li className="flex gap-1.5">
-                                  <span>1.</span>
-                                  <span>Payment is due in full at the time of delivery of the vehicle.</span>
+                                  <span className="shrink-0">
+                                    <EditableText
+                                      value={txt('term1Num')}
+                                      onChange={(v) => setTxt('term1Num', v)}
+                                      ariaLabel="Term 1 number"
+                                    />
+                                  </span>
+                                  <span className="flex-1">
+                                    <EditableText
+                                      value={txt('term1')}
+                                      onChange={(v) => setTxt('term1', v)}
+                                      ariaLabel="Term 1"
+                                    />
+                                  </span>
                                 </li>
                                 <li className="flex gap-1.5">
-                                  <span>2.</span>
-                                  <span>Warranty and service claims are processed as per official Yadea Hussain Motors policy.</span>
+                                  <span className="shrink-0">
+                                    <EditableText
+                                      value={txt('term2Num')}
+                                      onChange={(v) => setTxt('term2Num', v)}
+                                      ariaLabel="Term 2 number"
+                                    />
+                                  </span>
+                                  <span className="flex-1">
+                                    <EditableText
+                                      value={txt('term2')}
+                                      onChange={(v) => setTxt('term2', v)}
+                                      ariaLabel="Term 2"
+                                    />
+                                  </span>
                                 </li>
                               </ol>
                             </div>
@@ -1775,12 +2176,42 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                           >
                             <Handles id="totalsBlock" />
                             <div className="flex justify-between items-center px-1 gap-2">
-                              <span>Value Excl. Tax:</span>
-                              <span className="text-right whitespace-nowrap">Rs {formatMoney(totalExcl)}</span>
+                              <span>
+                                <EditableText
+                                  value={txt('labelTotalsValueExcl')}
+                                  onChange={(v) => setTxt('labelTotalsValueExcl', v)}
+                                  ariaLabel="Totals value excluding tax label"
+                                />
+                              </span>
+                              <span className="flex items-baseline justify-end whitespace-nowrap">
+                                {currencyEl}{' '}
+                                {moneyNode(
+                                  'totalExcl',
+                                  totalExcl,
+                                  calcTotalExcl,
+                                  'text-right',
+                                  'Totals value excluding tax'
+                                )}
+                              </span>
                             </div>
                             <div className="flex justify-between items-center px-1 gap-2">
-                              <span>Sales Tax Payable:</span>
-                              <span className="text-right whitespace-nowrap">Rs {formatMoney(taxPayable)}</span>
+                              <span>
+                                <EditableText
+                                  value={txt('labelTotalsTaxPayable')}
+                                  onChange={(v) => setTxt('labelTotalsTaxPayable', v)}
+                                  ariaLabel="Totals sales tax payable label"
+                                />
+                              </span>
+                              <span className="flex items-baseline justify-end whitespace-nowrap">
+                                {currencyEl}{' '}
+                                {moneyNode(
+                                  'taxPayable',
+                                  taxPayable,
+                                  calcTaxPayable,
+                                  'text-right',
+                                  'Totals sales tax payable'
+                                )}
+                              </span>
                             </div>
                             <div className="pt-2">
                               <div
@@ -1791,10 +2222,21 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                                   className="px-3.5 py-1 rounded-full text-[10px] sm:text-xs uppercase tracking-wider"
                                   style={{ backgroundColor: elO('totalsBlock').colorB ?? design.accentColor }}
                                 >
-                                  Total Payable:
+                                  <EditableText
+                                    value={txt('labelTotalPayable')}
+                                    onChange={(v) => setTxt('labelTotalPayable', v)}
+                                    ariaLabel="Total payable label"
+                                  />
                                 </div>
-                                <div className="pr-3 tracking-wide text-xs sm:text-sm font-black whitespace-nowrap">
-                                  Rs {formatMoney(totalIncl)}
+                                <div className="pr-3 flex items-baseline justify-end tracking-wide text-xs sm:text-sm font-black whitespace-nowrap">
+                                  {currencyEl}{' '}
+                                  {moneyNode(
+                                    'totalIncl',
+                                    totalIncl,
+                                    calcTotalIncl,
+                                    'text-right font-black',
+                                    'Total payable'
+                                  )}
                                 </div>
                               </div>
                             </div>
@@ -1819,18 +2261,32 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
                         >
                           <Handles id="signature" />
                           <div className="text-left pb-1">
-                            <p className="text-xs font-semibold text-slate-700 italic mb-0.5">For &amp; on Behalf of</p>
+                            <p className="text-xs font-semibold text-slate-700 italic mb-0.5">
+                              <EditableText
+                                value={txt('labelForOnBehalfOf')}
+                                onChange={(v) => setTxt('labelForOnBehalfOf', v)}
+                                ariaLabel="Signature company prefix"
+                              />
+                            </p>
                             <h3
                               className="text-base md:text-lg font-black tracking-tight"
                               style={{ color: elO('signature').colorA ?? design.accentColor }}
                             >
-                              Yadea Hussain Motors
+                              <EditableText
+                                value={txt('signatureName')}
+                                onChange={(v) => setTxt('signatureName', v)}
+                                ariaLabel="Signature company name"
+                              />
                             </h3>
                           </div>
                           <div className="text-center w-48">
                             <div className="border-b-2 border-slate-900 h-10" />
                             <span className="text-xs font-bold text-slate-900 tracking-wider uppercase mt-1 block">
-                              Signature
+                              <EditableText
+                                value={txt('labelSignature')}
+                                onChange={(v) => setTxt('labelSignature', v)}
+                                ariaLabel="Signature caption"
+                              />
                             </span>
                           </div>
                         </div>
