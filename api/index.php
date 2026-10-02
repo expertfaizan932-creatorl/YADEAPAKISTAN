@@ -17,7 +17,7 @@
  *  DELETE /api/index.php/staff/{id}             -> delete staff user
  *  PUT  /api/index.php/contacts/{id}            -> update contact (e.g. assigned_to)
  *
- *  GET  /api/index.php/invoices                  -> list invoices (filters: search, created_by)
+ *  GET  /api/index.php/invoices                  -> list invoices (filter: search); Admins see all, others their own
  *  GET  /api/index.php/invoices/next-number      -> suggested next sequential invoice number
  *  POST /api/index.php/invoices                  -> create sales tax invoice
  *  PUT  /api/index.php/invoices/{id}             -> update sales tax invoice
@@ -27,8 +27,10 @@
  *                                                 { to, cc?, bcc?, subject, html, from_name? }
  * POST /api/index.php/emails/test              -> deliverability check { to, subject?, html? }
  *
- *  GET  /api/index.php/submissions              -> portal submissions (type, assigned_to, restrict_to, search)
- * POST /api/index.php/submissions               -> create dealership application / inquiry ticket
+ *  GET  /api/index.php/submissions              -> portal submissions (type, assigned_to, search)
+ *                                                 Admins see all; everybody else
+ *                                                 only rows assigned to them.
+ * POST /api/index.php/submissions               -> create dealership application / inquiry ticket (public)
  * POST /api/index.php/submissions/{id}/assign   -> { assigned_to } (0 = unassign)
  * DELETE /api/index.php/submissions/{id}        -> remove a submission
  *
@@ -75,6 +77,12 @@ function to_int(string $v): int
     return (int)$v;
 }
 
+/**
+ * Build the WHERE clause for contacts/leads queries.
+ *
+ * Tenancy is appended from the CALLER's identity, never from the request. See
+ * contact_scope_clause() for the visibility rules.
+ */
 function build_where(array $filters, array &$params): string
 {
     $clauses = [];
@@ -103,14 +111,11 @@ function build_where(array $filters, array &$params): string
         $params[':lead'] = to_int($filters['lead']);
         $clauses[] = 'is_lead = :lead';
     }
-    if (!empty($filters['restrict_to'])) {
-        // Restricted users only see data assigned to them or that they follow.
-        // (Two distinct placeholders: MySQL native prepares reject reused names.)
-        $rid = to_int((string)$filters['restrict_to']);
-        $params[':rid_owner'] = $rid;
-        $params[':rid_follower'] = $rid;
-        $clauses[] = '(assigned_to = :rid_owner OR id IN (SELECT contact_id FROM contact_followers WHERE staff_id = :rid_follower))';
-    }
+    // NOTE: a `restrict_to` query parameter is deliberately ignored. It used to
+    // be the only visibility filter and it came straight from the URL, so a
+    // dealer could just leave it out and read the whole CRM.
+    // Tenancy is applied below from the caller's session token.
+    $clauses[] = contact_scope_clause('', current_user_id(), $params, 'scope');
 
     return $clauses ? (' WHERE ' . implode(' AND ', $clauses)) : '';
 }
@@ -162,6 +167,7 @@ function contact_followers(int $contactId): array
 /** Single contact with tags. */
 function get_contact(int $id): void
 {
+    require_contact_access($id);
     $stmt = db()->prepare('SELECT * FROM v_contacts_with_tags WHERE id = :id');
     $stmt->execute([':id' => $id]);
     $row = $stmt->fetch();
@@ -238,6 +244,37 @@ function merge_custom_fields(?string $existingRaw, ?string $incomingRaw): ?strin
 }
 
 /** Create a contact (accepts first_name/last_name or a combined name). */
+/**
+ * POST /public/leads — a website form submission.
+ *
+ * This is the ONLY contact write the anonymous internet may perform. It exists
+ * because the public form used to POST to /contacts, which now requires a
+ * session. Everything that could route or influence a record is stripped
+ * rather than trusted:
+ *
+ *   - assigned_to is forced to nobody, so a public visitor can never drop a
+ *     lead into a dealer's pipeline (or trigger their notifications);
+ *   - contact_type is forced to Lead;
+ *   - tags are trimmed to short labels instead of being taken verbatim;
+ *   - it never merges into an existing contact, so it cannot be used to probe
+ *     whether an email/phone is already in the CRM, nor to overwrite it.
+ */
+function create_public_lead(array $body): void
+{
+    unset($body['assigned_to'], $body['staff_id'], $body['user_id'], $body['id'], $body['avatar_data']);
+
+    $body['contact_type'] = 'Lead';
+
+    $tags = [];
+    foreach (array_slice((array)($body['tags'] ?? []), 0, 10) as $t) {
+        $t = trim(preg_replace('/[^\p{L}\p{N} \-_]/u', '', (string)$t) ?? '');
+        if ($t !== '') $tags[] = mb_substr($t, 0, 50);
+    }
+    $body['tags'] = $tags;
+
+    create_contact($body);
+}
+
 function create_contact(array $body): void
 {
     $firstName = normalize_optional($body['first_name'] ?? null);
@@ -320,6 +357,14 @@ function create_contact(array $body): void
             $dupStmt->execute($dupParams);
             $dupId = $dupStmt->fetchColumn();
             if ($dupId !== false) $existingId = (int)$dupId;
+        }
+
+        // Only merge into a contact the caller can actually see. Without this a
+        // dealer (or a public website form) could submit somebody else's email
+        // and overwrite — and un-soft-delete — that person's record, because the
+        // dedupe lookup ran across every tenant.
+        if ($existingId > 0 && !caller_can_access_contact($existingId)) {
+            $existingId = 0;
         }
 
         if ($existingId > 0) {
@@ -440,10 +485,11 @@ function create_contact(array $body): void
 /** Soft-delete one contact: hides it from every live view but keeps the DB row. */
 function delete_contact(int $id): void
 {
+    require_contact_access($id);
     $stmt = db()->prepare('UPDATE contacts SET deleted_at = NOW(), last_activity_at = NOW() WHERE id = :id AND deleted_at IS NULL');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Contact not found', 404);
-    prune_smart_lists_when_empty();
+    prune_smart_lists_when_empty([$id]);
     respond(['message' => 'Contact deleted']);
 }
 
@@ -453,24 +499,50 @@ function bulk_delete(array $body): void
     $ids = array_values(array_filter(array_map('to_int', (array)($body['ids'] ?? [])), fn($i) => $i > 0));
     if (!$ids) fail('No ids provided');
 
-    $placeholders = implode(',', array_fill(0, count($ids), '?'));
-    $stmt = db()->prepare("UPDATE contacts SET deleted_at = NOW(), last_activity_at = NOW() WHERE id IN ($placeholders) AND deleted_at IS NULL");
-    $stmt->execute($ids);
+    // Check every id against the caller's tenancy before deleting anything, so a
+    // mixed batch cannot be used to reach another dealer's contacts.
+    $allowed = array_values(array_filter($ids, 'caller_can_access_contact'));
+    if ($allowed !== $ids) {
+        fail('Some contacts are not yours and cannot be deleted.', 403);
+    }
 
-    prune_smart_lists_when_empty();
+    $placeholders = implode(',', array_fill(0, count($allowed), '?'));
+    $stmt = db()->prepare("UPDATE contacts SET deleted_at = NOW(), last_activity_at = NOW() WHERE id IN ($placeholders) AND deleted_at IS NULL");
+    $stmt->execute($allowed);
+
+    prune_smart_lists_when_empty($allowed);
 
     respond(['message' => 'Deleted ' . $stmt->rowCount() . ' contact(s)']);
 }
 
 /**
- * When the very last contact is deleted, every smart list becomes meaningless
- * (there is nothing left to group), so remove them all.
+ * Drop a deleted contact out of the smart lists that referenced it.
+ *
+ * This used to DELETE every smart list in the table once the last contact was
+ * removed, wiping other dealers' lists along with it. It now only unlinks the
+ * ids the caller just deleted, and only from lists the caller can see.
  */
-function prune_smart_lists_when_empty(): void
+function prune_smart_lists_when_empty(array $deletedIds): void
 {
-    $count = (int)db()->query('SELECT COUNT(*) FROM contacts WHERE deleted_at IS NULL')->fetchColumn();
-    if ($count === 0) {
-        db()->exec('DELETE FROM smart_lists');
+    $ids = array_values(array_filter(array_map('to_int', $deletedIds), fn($i) => $i > 0));
+    if (!$ids) return;
+
+    $rows = db()->query('SELECT id, members, created_by FROM smart_lists')->fetchAll();
+    foreach ($rows as $row) {
+        // Admins maintain the shared/outlet lists; nobody else may edit them.
+        if ((int)$row['created_by'] !== current_user_id() && !is_api_admin()) continue;
+
+        $members = array_values(array_filter(array_map(
+            'to_int',
+            array_filter(explode(',', (string)($row['members'] ?? '')), 'strlen')
+        )));
+        if (!$members) continue;
+
+        $kept = array_values(array_diff($members, $ids));
+        if (count($kept) === count($members)) continue;
+
+        db()->prepare('UPDATE smart_lists SET members = :members WHERE id = :id')
+            ->execute([':members' => implode(',', $kept), ':id' => (int)$row['id']]);
     }
 }
 
@@ -548,13 +620,9 @@ function list_leads(array $filters): void
         }
         $clauses[] = '(' . implode(' OR ', $pats) . ')';
     }
-    if (!empty($filters['restrict_to'])) {
-        $rid = to_int((string)$filters['restrict_to']);
-        $params[':rid_owner'] = $rid;
-        $params[':rid_follower'] = $rid;
-        $clauses[] = '(assigned_to = :rid_owner OR id IN (SELECT contact_id FROM contact_followers WHERE staff_id = :rid_follower))';
-    }
-    $where = $clauses ? (' WHERE ' . implode(' AND ', $clauses)) : '';
+    // Tenancy from the session, not from `?restrict_to=` (see build_where).
+    $clauses[] = contact_scope_clause('', current_user_id(), $params, 'scope');
+    $where = ' WHERE ' . implode(' AND ', $clauses);
     $order = order_clause($filters);
 
     $stmt = db()->prepare('SELECT * FROM v_leads' . $where . $order);
@@ -572,9 +640,16 @@ function list_leads(array $filters): void
 
 /* ------------------ CONTACT SUB-RESOURCES ------------------ */
 
+/**
+ * Every contact sub-resource (opportunities, tasks, notes, appointments,
+ * followers, activities) funnels through here, so this is the single place
+ * that stops a dealer reading another dealer's contact by guessing an id.
+ * Returns 404 rather than 403 so ids cannot be probed for existence.
+ */
 function ensure_contact_exists(int $contactId): void
 {
-    $stmt = db()->prepare('SELECT id FROM contacts WHERE id = :id');
+    require_contact_access($contactId);
+    $stmt = db()->prepare('SELECT id FROM contacts WHERE id = :id AND deleted_at IS NULL');
     $stmt->execute([':id' => $contactId]);
     if (!$stmt->fetch()) fail('Contact not found', 404);
 }
@@ -624,6 +699,11 @@ function create_opportunity(int $contactId, array $body): void
 
 function delete_opportunity(int $id): void
 {
+    // Opportunities hang off a contact, so they inherit its tenancy: resolve the
+    // parent contact and run the normal access guard instead of trusting a bare
+    // opportunity id (which would let anybody delete any dealer's deal).
+    require_child_contact_access('opportunities', $id);
+
     $stmt = db()->prepare('DELETE FROM opportunities WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Opportunity not found', 404);
@@ -654,8 +734,27 @@ function create_task(int $contactId, array $body): void
     respond(['data' => ['id' => (int)db()->lastInsertId()], 'message' => 'Task created'], 201);
 }
 
+/**
+ * Resolve the parent contact of a child row and run the standard access guard.
+ *
+ * Tasks, notes, appointments and opportunities are addressed by their own id, so
+ * without this a caller could read or delete any dealer's rows by guessing ids.
+ * Returns the parent contact id, or 404s.
+ */
+function require_child_contact_access(string $table, int $id): int
+{
+    // $table is never user input - every call site passes a literal.
+    $stmt = db()->prepare("SELECT contact_id FROM {$table} WHERE id = :id");
+    $stmt->execute([':id' => $id]);
+    $contactId = $stmt->fetchColumn();
+    if ($contactId === false) fail('Not found', 404);
+    require_contact_access((int)$contactId);
+    return (int)$contactId;
+}
+
 function delete_task(int $id): void
 {
+    require_child_contact_access('tasks', $id);
     $stmt = db()->prepare('DELETE FROM tasks WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Task not found', 404);
@@ -705,6 +804,7 @@ function create_note(int $contactId, array $body): void
 
 function delete_note(int $id): void
 {
+    require_child_contact_access('notes', $id);
     $stmt = db()->prepare('DELETE FROM notes WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Note not found', 404);
@@ -746,20 +846,43 @@ function create_appointment(int $contactId, array $body): void
 
 function delete_appointment(int $id): void
 {
+    require_child_contact_access('appointments', $id);
     $stmt = db()->prepare('DELETE FROM appointments WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Appointment not found', 404);
     respond(['message' => 'Appointment deleted']);
 }
 
-/** List every appointment (used by the Sites analytics tab to count test-ride bookings). */
+/**
+ * List every appointment (used by the Sites analytics tab to count test-ride
+ * bookings).
+ *
+ * Appointments carry customer names, notes and locations, so an unfiltered
+ * dump is a cross-tenant read. Non-Admins get only the appointments belonging
+ * to contacts they own or follow.
+ */
 function list_all_appointments(): void
 {
-    $rows = db()->query(
-        'SELECT id, contact_id, title, calendar, host, date, start_time, end_time,
-                location, status, notes, category, created_at
-           FROM appointments ORDER BY created_at DESC'
-    )->fetchAll();
+    $params = [];
+    $where = '';
+    if (!is_api_admin()) {
+        $params[':owner'] = current_user_id();
+        $params[':follower'] = current_user_id();
+        $where = 'WHERE a.contact_id IN (
+            SELECT c.id FROM contacts c
+             WHERE c.deleted_at IS NULL
+               AND (c.assigned_to = :owner
+                    OR c.id IN (SELECT contact_id FROM contact_followers WHERE staff_id = :follower))
+        )';
+    }
+
+    $stmt = db()->prepare(
+        'SELECT a.id, a.contact_id, a.title, a.calendar, a.host, a.date, a.start_time, a.end_time,
+                a.location, a.status, a.notes, a.category, a.created_at
+           FROM appointments a ' . $where . ' ORDER BY a.created_at DESC'
+    );
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll();
     respond(['data' => $rows, 'count' => count($rows)]);
 }
 
@@ -785,6 +908,20 @@ function encode_json_field($value): ?string
 function list_staff(): void
 {
     ensure_approval_column();
+
+    // The staff directory carries emails, phones and permission JSON, so a full
+    // dump is Admin-only. Everyone else gets a minimal picker list (id, name,
+    // role) which is all the UI needs to show a name next to a record.
+    if (!is_api_admin()) {
+        $rows = db()->query(
+            'SELECT id, first_name, last_name, full_name, user_type, avatar_data
+               FROM staff_users
+              WHERE approved = 1 OR approved IS NULL
+              ORDER BY full_name'
+        )->fetchAll();
+        respond(['data' => $rows, 'count' => count($rows)]);
+    }
+
     $rows = db()->query('SELECT * FROM staff_users ORDER BY full_name')->fetchAll();
 
     $payload = array_map('staff_payload', $rows);
@@ -957,6 +1094,7 @@ function upsert_staff(array $body, ?int $existingId = null): int
 
 function create_staff(array $body): void
 {
+    require_api_admin();
     try {
         $id = upsert_staff($body, null);
     } catch (PDOException $e) {
@@ -968,6 +1106,21 @@ function create_staff(array $body): void
 
 function update_staff(int $id, array $body): void
 {
+    // Editing somebody is Admin's job — except your own profile, which the
+    // Settings page uses the same endpoint for. A non-Admin may only edit
+    // themselves, and may never change their own role or approval state.
+    $caller = require_api_user();
+    if (($caller['user_type'] ?? '') !== 'Admin') {
+        if ($id !== (int)$caller['id']) {
+            fail('You can only update your own profile.', 403);
+        }
+        if (array_key_exists('user_type', $body) && (string)$body['user_type'] !== (string)$caller['user_type']) {
+            fail('Only an administrator can change a user role.', 403);
+        }
+        if (array_key_exists('approved', $body) && (int)$body['approved'] !== (int)($caller['approved'] ?? 1)) {
+            fail('Only an administrator can approve accounts.', 403);
+        }
+    }
     try {
         $updated = upsert_staff($body, $id);
     } catch (PDOException $e) {
@@ -979,6 +1132,7 @@ function update_staff(int $id, array $body): void
 
 function delete_staff(int $id): void
 {
+    require_api_admin();
     $stmt = db()->prepare('DELETE FROM staff_users WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Staff user not found', 404);
@@ -999,6 +1153,13 @@ function update_contact(int $id, array $body): void
             $check->execute([':id' => $assignedTo]);
             if (!$check->fetch()) fail('Assigned staff user not found', 404);
         }
+    }
+
+    // Reassigning a contact decides who owns it, so it is an Admin-only move.
+    // Without this a dealer could hand (or dump) a contact into somebody else's
+    // pipeline, or strip the owner to make it vanish from the dealer's list.
+    if (array_key_exists('assigned_to', $body) && !is_api_admin()) {
+        fail('Only an administrator can assign or reassign a contact.', 403);
     }
 
     $allowed = ['first_name', 'last_name', 'phone', 'email', 'business_name', 'contact_type', 'notes', 'avatar_data'];
@@ -1106,10 +1267,18 @@ function list_followers(int $contactId): void
     respond(['data' => $rows->fetchAll(), 'count' => $rows->rowCount()]);
 }
 
-/** Add a follower. Owner and follower are mutually exclusive: a follower can
- *  never be the assigned owner, and the assigned owner can never be a follower. */
+/**
+ * Add a follower.
+ *
+ * Admin-only, and deliberately refuses to strip an existing owner. Follower
+ * rows are what grant a Dealer/Follower visibility of somebody else's contact,
+ * so letting anyone add themselves as a follower would have made the whole
+ * tenancy rule meaningless (and nulling assigned_to hid the contact from its
+ * owner as a side effect).
+ */
 function add_follower(int $contactId, array $body): void
 {
+    require_api_admin();
     ensure_contact_exists($contactId);
     $staffId = to_int((string)($body['staff_id'] ?? 0));
     if ($staffId <= 0) fail('staff_id is required');
@@ -1119,17 +1288,19 @@ function add_follower(int $contactId, array $body): void
     if (!$check->fetch()) fail('Staff user not found', 404);
 
     $pdo = db();
-    $nmStmt = $pdo->prepare('SELECT full_name FROM contacts WHERE id = :id');
+    $nmStmt = $pdo->prepare('SELECT full_name, assigned_to FROM contacts WHERE id = :id');
     $nmStmt->execute([':id' => $contactId]);
     $nmRow = $nmStmt->fetch();
     $contactName = $nmRow['full_name'] ?? 'Contact';
 
+    // Owner and follower are mutually exclusive. Ask the Admin to reassign the
+    // contact first rather than silently cancelling the ownership.
+    if ((int)($nmRow['assigned_to'] ?? 0) === $staffId) {
+        fail('This person already owns the contact. Reassign it before sharing it as a follower.', 409);
+    }
+
     $pdo->beginTransaction();
     try {
-        // Mutual exclusion: if this staff is the assigned owner, remove that role.
-        $pdo->prepare('UPDATE contacts SET assigned_to = NULL WHERE id = :cid AND assigned_to = :sid')
-            ->execute([':cid' => $contactId, ':sid' => $staffId]);
-
         $stmt = $pdo->prepare('INSERT IGNORE INTO contact_followers (contact_id, staff_id) VALUES (:c, :s)');
         $stmt->execute([':c' => $contactId, ':s' => $staffId]);
         $added = $stmt->rowCount() > 0;
@@ -1152,9 +1323,10 @@ function add_follower(int $contactId, array $body): void
     respond(['message' => 'Follower added'], 201);
 }
 
-/** Remove a follower. */
+/** Remove a follower. Admin-only. */
 function remove_follower(int $contactId, int $staffId): void
 {
+    require_api_admin();
     ensure_contact_exists($contactId);
     $stmt = db()->prepare('DELETE FROM contact_followers WHERE contact_id = :c AND staff_id = :s');
     $stmt->execute([':c' => $contactId, ':s' => $staffId]);
@@ -1196,6 +1368,256 @@ function create_activity(int $contactId, array $body): void
 }
 
 /* ----------------------- AUTH & NOTIFICATIONS ----------------------- */
+
+/* ------------------- SERVER-SIDE IDENTITY (multi-tenancy) -------------------
+ *
+ * Every read and write below is scoped from these helpers. The identity comes
+ * from a bearer token minted at login — never from a query string — so a
+ * Dealer or Follower cannot widen their own visibility by editing a URL.
+ *
+ * Rules enforced here:
+ *   Admin    -> sees and manages everything.
+ *   Dealer   -> sees only contacts assigned to them, plus contacts an Admin
+ *               has explicitly shared with them as a follower.
+ *   Follower -> same rule as Dealer. A Follower never inherits their manager's
+ *               (the Dealer's) book, so "apna data" means exactly that.
+ *
+ * Contacts with no assigned_to are invisible to everyone except Admins. That
+ * is the unassigned pool: public website forms and CSV imports land there and
+ * stay there until an Admin assigns them to a dealer.
+ */
+
+/** Create the tables the scoping rules depend on. Idempotent, runs once/request. */
+function ensure_identity_tables(): void
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+
+    db()->exec(
+        'CREATE TABLE IF NOT EXISTS contact_followers (
+            contact_id INT NOT NULL,
+            staff_id   INT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (contact_id, staff_id),
+            INDEX idx_cf_staff (staff_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+    );
+
+    db()->exec(
+        'CREATE TABLE IF NOT EXISTS staff_sessions (
+            id         INT AUTO_INCREMENT PRIMARY KEY,
+            staff_id   INT NOT NULL,
+            token_hash CHAR(64) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NULL,
+            UNIQUE KEY uq_staff_sessions_token (token_hash),
+            INDEX idx_staff_sessions_staff (staff_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+    );
+}
+
+/** Mint a session token for a staff user. Only the SHA-256 is stored. */
+function issue_api_token(int $staffId): string
+{
+    ensure_identity_tables();
+    $token = bin2hex(random_bytes(32));
+    $stmt = db()->prepare(
+        'INSERT INTO staff_sessions (staff_id, token_hash, expires_at)
+         VALUES (:sid, :hash, DATE_ADD(NOW(), INTERVAL 30 DAY))'
+    );
+    $stmt->execute([':sid' => $staffId, ':hash' => hash('sha256', $token)]);
+    return $token;
+}
+
+/** Revoke a session token (used by /auth/logout). */
+function revoke_api_token(string $token): void
+{
+    ensure_identity_tables();
+    db()->prepare('DELETE FROM staff_sessions WHERE token_hash = :hash')
+        ->execute([':hash' => hash('sha256', $token)]);
+}
+
+/** Read the bearer token off the request, if the browser sent one. */
+function api_bearer_token(): ?string
+{
+    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    if ($header === '' && function_exists('apache_request_headers')) {
+        $headers = apache_request_headers();
+        foreach ($headers as $name => $value) {
+            if (strcasecmp($name, 'Authorization') === 0) {
+                $header = (string)$value;
+                break;
+            }
+        }
+    }
+    if (stripos($header, 'Bearer ') !== 0) return null;
+    $token = trim(substr($header, 7));
+    return $token === '' ? null : $token;
+}
+
+/**
+ * Resolve the caller from the bearer token, honouring an Admin's "Login as"
+ * impersonation. Returns null when there is no valid session.
+ *
+ * Impersonation is request-scoped rather than a second token: the Admin's own
+ * token stays in play and X-Acting-As only takes effect for an Admin, so a
+ * Dealer cannot smuggle in somebody else's identity.
+ */
+function api_current_user(): ?array
+{
+    static $resolved = false;
+    static $user = null;
+    if ($resolved) return $user;
+    $resolved = true;
+
+    $token = api_bearer_token();
+    if ($token === null) return null;
+
+    ensure_identity_tables();
+    $stmt = db()->prepare(
+        'SELECT s.* FROM staff_sessions ss
+           JOIN staff_users s ON s.id = ss.staff_id
+          WHERE ss.token_hash = :hash
+            AND (ss.expires_at IS NULL OR ss.expires_at > NOW())'
+    );
+    $stmt->execute([':hash' => hash('sha256', $token)]);
+    $actor = $stmt->fetch();
+    if (!$actor) return null;
+    // A deactivated or re-typed account loses access immediately.
+    if (isset($actor['approved']) && (int)$actor['approved'] !== 1) return null;
+
+    $actingId = (int)($_SERVER['HTTP_X_ACTING_AS'] ?? 0);
+    if ($actingId > 0 && $actingId !== (int)$actor['id']) {
+        if (($actor['user_type'] ?? '') !== 'Admin') {
+            fail('Only an Admin may view the CRM as another user.', 403);
+        }
+        $imp = db()->prepare('SELECT * FROM staff_users WHERE id = :id');
+        $imp->execute([':id' => $actingId]);
+        $target = $imp->fetch();
+        if (!$target) fail('The user being viewed no longer exists.', 404);
+        if (isset($target['approved']) && (int)$target['approved'] !== 1) {
+            fail('That account is pending approval and cannot be viewed.', 403);
+        }
+        $target['_impersonated_by'] = (int)$actor['id'];
+        $user = $target;
+    } else {
+        $user = $actor;
+    }
+    return $user;
+}
+
+/** The caller, or 401. Use at the top of every non-public endpoint. */
+function require_api_user(): array
+{
+    $user = api_current_user();
+    if ($user === null) {
+        fail('Your session has expired. Please sign in again.', 401);
+    }
+    return $user;
+}
+
+/** The caller, or 403 unless they are an Admin. */
+function require_api_admin(): array
+{
+    $user = require_api_user();
+    if (($user['user_type'] ?? '') !== 'Admin') {
+        fail('This action is restricted to administrators.', 403);
+    }
+    return $user;
+}
+
+/** Effective staff id of the caller (the impersonated user when acting). */
+function current_user_id(): int
+{
+    $user = require_api_user();
+    return (int)$user['id'];
+}
+
+function is_api_admin(): bool
+{
+    $user = api_current_user();
+    return $user !== null && ($user['user_type'] ?? '') === 'Admin';
+}
+
+/* -------------------------- contact tenancy rules -------------------------- */
+
+/**
+ * SQL fragment (with its placeholders) limiting a contacts query to what the
+ * caller may see. Admins get an always-true clause; everyone else is limited
+ * to rows assigned to them or shared with them as a follower, so unassigned
+ * leads stay out of sight until an Admin hands them over.
+ *
+ * $alias is the contacts table/view alias in the calling query.
+ */
+function contact_scope_clause(string $alias, int $userId, array &$params, string $prefix): string
+{
+    // Fail CLOSED, never open. An unknown user id (an anonymous caller, or a
+    // session that resolved to nothing) must see nothing - returning 1 = 1
+    // here would hand the whole book to anybody who reached this function.
+    if ($userId <= 0) return '1 = 0';
+    if (is_api_admin()) return '1 = 1';
+
+    // The prefix names the placeholders; the leading colon is ours to add.
+    // Callers used to pass ':scope', and the leading colon ended up in the SQL
+    // too ('::scopeowner'), which is a syntax error. Strip it here.
+    $prefix = ltrim($prefix, ':');
+    // Likewise the alias needs its dot ('c' -> 'c.'), or the column comes out
+    // as one long name ('cassigned_to').
+    if ($alias !== '') $alias = rtrim($alias, '.') . '.';
+
+    $params[':' . $prefix . 'owner'] = $userId;
+    $params[':' . $prefix . 'follower'] = $userId;
+    // Two distinct placeholder names: native prepares reject a reused name.
+    return "({$alias}assigned_to = :{$prefix}owner"
+        . " OR {$alias}id IN (SELECT contact_id FROM contact_followers WHERE staff_id = :{$prefix}follower))";
+}
+
+/**
+ * True when the caller may touch this contact.
+ *
+ * An anonymous caller (the public website form) gets false rather than a 401,
+ * so it simply never merges into an existing record - it always files a fresh
+ * lead instead of overwriting somebody else's.
+ */
+function caller_can_access_contact(int $contactId): bool
+{
+    $user = api_current_user();
+    if ($user === null) return false;
+    if (($user['user_type'] ?? '') === 'Admin') return true;
+    $params = [':cid' => $contactId];
+    $clause = contact_scope_clause('c', (int)$user['id'], $params, 'who');
+    $stmt = db()->prepare("SELECT 1 FROM contacts c WHERE c.id = :cid AND {$clause} LIMIT 1");
+    $stmt->execute($params);
+    return (bool)$stmt->fetchColumn();
+}
+
+/** Guard for a single-contact route; 404s so ids cannot be probed. */
+function require_contact_access(int $contactId): void
+{
+    if (!caller_can_access_contact($contactId)) {
+        fail('Contact not found', 404);
+    }
+}
+
+/** Ids of every contact the caller may see — used to trim shared lists. */
+function accessible_contact_ids(int $userId): array
+{
+    // Fail closed: an unresolved user sees nothing (see contact_scope_clause).
+    if ($userId <= 0) return [];
+    if (is_api_admin()) {
+        $rows = db()->query('SELECT id FROM contacts WHERE deleted_at IS NULL')->fetchAll();
+        return array_map(static fn($r) => (int)$r['id'], $rows);
+    }
+    $stmt = db()->prepare(
+        'SELECT c.id FROM contacts c
+          WHERE c.deleted_at IS NULL
+            AND (c.assigned_to = :owner
+                 OR c.id IN (SELECT contact_id FROM contact_followers WHERE staff_id = :follower))'
+    );
+    $stmt->execute([':owner' => $userId, ':follower' => $userId]);
+    return array_map(static fn($r) => (int)$r['id'], $stmt->fetchAll());
+}
 
 /** Shape a staff row for API responses: decode JSON fields, hide password. */
 function staff_payload(array $row): array
@@ -1251,10 +1673,14 @@ function magic_login(array $body): void
     if ((int)($row['approved'] ?? 1) !== 1) {
         fail('Your account is pending admin approval.', 403);
     }
-    respond(['data' => staff_payload($row), 'message' => 'Login successful']);
+    respond([
+        'data' => staff_payload($row),
+        'token' => issue_api_token((int)$row['id']),
+        'message' => 'Login successful',
+    ]);
 }
 
-/** POST /auth/login  { email, password } -> the staff user or 401. */
+/** POST /auth/login  { email, password } -> the staff user, a token, or 401. */
 function login(array $body): void
 {
     $email = normalize_optional($body['email'] ?? null);
@@ -1275,7 +1701,25 @@ function login(array $body): void
         fail('Your account is pending admin approval. You will receive an email once it is approved.', 403);
     }
 
-    respond(['data' => staff_payload($row), 'message' => 'Login successful']);
+    respond([
+        'data' => staff_payload($row),
+        'token' => issue_api_token((int)$row['id']),
+        'message' => 'Login successful',
+    ]);
+}
+
+/** POST /auth/logout -> drop the presented session token. */
+function logout(): void
+{
+    $token = api_bearer_token();
+    if ($token !== null) revoke_api_token($token);
+    respond(['message' => 'Signed out']);
+}
+
+/** GET /auth/me -> the caller, so the client can rehydrate a stale session. */
+function auth_me(): void
+{
+    respond(['data' => staff_payload(require_api_user())]);
 }
 
 /**
@@ -1605,50 +2049,30 @@ function register_dealer(array $body): void
     $findByEmail->execute([':email' => $email]);
     $existing = $findByEmail->fetch();
 
-    // Existing dealers keep their profile in sync when they register again:
-    // a freshly entered Dealership Code updates the stored system_id.
-    if ($existing && $systemId !== null && ($existing['system_id'] ?? null) !== $systemId) {
-        $pdo->prepare('UPDATE staff_users SET system_id = :sid WHERE id = :id')
-            ->execute([':sid' => $systemId, ':id' => $existing['id']]);
-        $existing['system_id'] = $systemId;
-    }
-
-    // Already an account AND we still know its password: hand it back as-is.
-    if ($existing && !empty($existing['password_plain'])) {
-        send_dealer_registration_mail(
-            $email,
-            trim($firstName . ' ' . $lastName),
-            (string)$existing['password_plain'],
-            (int)($existing['approved'] ?? 1) === 1
-        );
-        respond([
-            'data' => staff_payload($existing),
-            'password' => $existing['password_plain'],
-            'message' => 'Existing dealer account',
-        ]);
-    }
-
-    // New account, or an existing one whose password is not recoverable:
-    // (re)set the credentials so this submitter can always be logged in.
-    $plain = generate_strong_password();
-    $hash = hash_password($plain);
-
+    /* EXISTING ACCOUNT - read-only, and deliberately quiet.
+     *
+     * This endpoint is unauthenticated, so it used to be a full account
+     * takeover for anybody who knew an email address: it returned the stored
+     * plaintext password for that account (Admins included), and when no
+     * plaintext copy existed it overwrote the password instead, locking the
+     * real owner out. Both are gone.
+     *
+     * The registration flow still works: the credentials are emailed to the
+     * account's own registered address, and the response simply omits them. The
+     * response is identical whether or not the address exists, so this endpoint
+     * cannot be used to enumerate staff accounts either.
+     */
     if ($existing) {
-        $upd = $pdo->prepare(
-            'UPDATE staff_users SET password = :p, password_plain = :pp WHERE id = :id'
-        );
-        $upd->execute([':p' => $hash, ':pp' => $plain, ':id' => $existing['id']]);
-        $findByEmail->execute([':email' => $email]);
         send_dealer_registration_mail(
             $email,
             trim($firstName . ' ' . $lastName),
-            $plain,
+            $existing['password_plain'] ?? null,
             (int)($existing['approved'] ?? 1) === 1
         );
         respond([
-            'data' => staff_payload($findByEmail->fetch()),
-            'password' => $plain,
-            'message' => 'Existing dealer account credentials reset',
+            'data' => null,
+            'password' => null,
+            'message' => 'If this email can be registered, the details have been sent to it.',
         ]);
     }
 
@@ -1675,7 +2099,9 @@ function register_dealer(array $body): void
         $ins->execute($insParams);
     } catch (PDOException $e) {
         if ($e->getCode() === '23000') {
-            // Raced with another submission for the same email.
+            // Raced with another submission for the same email. Same rule as
+            // the lookup above: mail the credentials to the account's own
+            // address, but never hand them back over HTTP.
             $findByEmail->execute([':email' => $email]);
             $row = $findByEmail->fetch();
             send_dealer_registration_mail(
@@ -1685,9 +2111,9 @@ function register_dealer(array $body): void
                 (int)($row['approved'] ?? 1) === 1
             );
             respond([
-                'data' => staff_payload($row),
-                'password' => $row['password_plain'] ?? null,
-                'message' => 'Existing dealer account',
+                'data' => null,
+                'password' => null,
+                'message' => 'If this email can be registered, the details have been sent to it.',
             ]);
         }
         fail('Database error: ' . $e->getMessage(), 500);
@@ -1724,6 +2150,8 @@ function register_dealer(array $body): void
  */
 function approve_staff(int $id): void
 {
+    // Granting an account access to the CRM is an Admin decision.
+    require_api_admin();
     ensure_approval_column();
     $pdo = db();
     $stmt = $pdo->prepare('SELECT * FROM staff_users WHERE id = :id');
@@ -1768,11 +2196,22 @@ function approve_staff(int $id): void
     respond(['data' => staff_payload($stmt->fetch()), 'message' => 'User approved']);
 }
 
-/** POST /auth/reveal-password { email } -> stored plain password (or null). */
+/**
+ * POST /auth/reveal-password { email } -> stored plain password (or null).
+ *
+ * This used to be reachable without a session, so anyone who guessed an email
+ * could read that account's password. It now requires signing in, and only
+ * returns your own password (Admins may look up any account).
+ */
 function reveal_password(array $body): void
 {
+    $caller = require_api_user();
     $email = normalize_optional($body['email'] ?? null);
     if ($email === null) fail('Email is required');
+    if (($caller['user_type'] ?? '') !== 'Admin'
+        && strcasecmp((string)($caller['email'] ?? ''), $email) !== 0) {
+        fail('You can only view your own password.', 403);
+    }
     ensure_password_plain_column();
     $stmt = db()->prepare('SELECT password_plain FROM staff_users WHERE email = :email LIMIT 1');
     $stmt->execute([':email' => $email]);
@@ -1816,11 +2255,12 @@ function notify_staff(int $staffId, ?int $contactId, string $type, string $title
     return $id;
 }
 
-/** GET /notifications?staff_id=N[&unread=1] -> list for one user. */
+/** GET /notifications[?unread=1] -> the caller's own notifications. */
 function list_notifications(array $filters): void
 {
-    $staffId = to_int((string)($filters['staff_id'] ?? 0));
-    if ($staffId <= 0) fail('staff_id is required');
+    // The owner is the signed-in user. A ?staff_id= parameter is ignored so a
+    // notification cannot be read by passing somebody else's id.
+    $staffId = current_user_id();
 
     $where = 'n.staff_id = :sid';
     $params = [':sid' => $staffId];
@@ -1860,30 +2300,29 @@ function list_notifications(array $filters): void
     respond(['data' => $data, 'count' => count($data)]);
 }
 
-/** GET /notifications/unread-count?staff_id=N */
-function notifications_unread_count(int $staffId): void
+/** GET /notifications/unread-count -> the caller's own unread count. */
+function notifications_unread_count(int $staffId = 0): void
 {
-    if ($staffId <= 0) fail('staff_id is required');
+    $staffId = current_user_id();
     $stmt = db()->prepare('SELECT COUNT(*) FROM notifications WHERE staff_id = :sid AND is_read = 0');
     $stmt->execute([':sid' => $staffId]);
     respond(['data' => ['unread' => (int)$stmt->fetchColumn()]]);
 }
 
-/** POST /notifications/{id}/read */
+/** POST /notifications/{id}/read -> only the caller's own notification. */
 function mark_notification_read(int $id): void
 {
-    $stmt = db()->prepare('UPDATE notifications SET is_read = 1 WHERE id = :id');
-    $stmt->execute([':id' => $id]);
+    $stmt = db()->prepare('UPDATE notifications SET is_read = 1 WHERE id = :id AND staff_id = :sid');
+    $stmt->execute([':id' => $id, ':sid' => current_user_id()]);
+    if ($stmt->rowCount() === 0) fail('Notification not found', 404);
     respond(['message' => 'Notification marked as read']);
 }
 
-/** POST /notifications/read-all  { staff_id } */
+/** POST /notifications/read-all -> clears the caller's own notifications. */
 function mark_all_notifications_read(array $body): void
 {
-    $staffId = to_int((string)($body['staff_id'] ?? 0));
-    if ($staffId <= 0) fail('staff_id is required');
     db()->prepare('UPDATE notifications SET is_read = 1 WHERE staff_id = :sid AND is_read = 0')
-        ->execute([':sid' => $staffId]);
+        ->execute([':sid' => current_user_id()]);
     respond(['message' => 'All notifications marked as read']);
 }
 
@@ -1898,13 +2337,32 @@ function create_notification(array $body): void
         'to_int',
         array_filter((array)($body['staff_ids'] ?? []), fn($s) => (int)$s > 0)
     )));
-    if (!$staffIds) fail('staff_ids is required');
+    if (!$staffIds) fail('staff_ids are required');
 
     $contactId = isset($body['contact_id']) && (int)$body['contact_id'] > 0
         ? (int)$body['contact_id'] : null;
+
+    if ($contactId !== null) {
+        // The caller must be able to see the contact, and the recipient list is
+        // trimmed to people who can see it too. Without this any signed-in user
+        // could drop an arbitrary message into any colleague's bell.
+        require_contact_access($contactId);
+        if (!is_api_admin()) {
+            $staffIds = array_values(array_filter(
+                $staffIds,
+                static fn($sid) => staff_can_access_contact($sid, $contactId)
+            ));
+            if (!$staffIds) fail('No recipients can be notified about that contact.', 403);
+        }
+    } else {
+        // A notification with no contact behind it has no tenancy to check, so
+        // only an Admin may raise one.
+        require_api_admin();
+    }
+
     $type = normalize_optional($body['type'] ?? null) ?? 'assignment';
-    $title = normalize_optional($body['title'] ?? null) ?? 'New notification';
-    $detail = normalize_optional($body['detail'] ?? null) ?? '';
+    $title = text_clip(normalize_optional($body['title'] ?? null) ?? 'New notification', 250);
+    $detail = text_clip(normalize_optional($body['detail'] ?? null) ?? '', 495);
 
     $ids = [];
     foreach ($staffIds as $sid) {
@@ -1913,14 +2371,32 @@ function create_notification(array $body): void
     respond(['data' => ['ids' => $ids, 'count' => count($ids)], 'message' => 'Notification(s) created'], 201);
 }
 
+/** True when this specific staff user may see the given contact. */
+function staff_can_access_contact(int $staffId, int $contactId): bool
+{
+    $stmt = db()->prepare(
+        'SELECT 1 FROM contacts c
+          WHERE c.id = :c AND c.deleted_at IS NULL
+            AND (c.assigned_to = :s
+                 OR c.id IN (SELECT contact_id FROM contact_followers WHERE staff_id = :s2))
+          LIMIT 1'
+    );
+    $stmt->execute([':c' => $contactId, ':s' => $staffId, ':s2' => $staffId]);
+    return (bool)$stmt->fetchColumn();
+}
+
 /* ----------------------- DEALER / FRANCHISE DASHBOARD ----------------------- */
 
 /**
- * Summary for the owner: per-dealer (User role) lead assignment counts and
- * how many unassigned leads are still waiting to be handed out.
+ * Per-dealer lead counts plus the size of the unassigned pool.
+ *
+ * This is the owner's control panel — it aggregates every dealer at once — so
+ * it is Admin-only. A Dealer/Follower gets their own numbers from
+ * my_dealer_leads() instead.
  */
 function dealer_dashboard_summary(): void
 {
+    require_api_admin();
     $rows = db()->query(
         "SELECT s.id AS dealer_id, s.full_name, s.email, s.phone, s.avatar_data,
                 COUNT(v.id) AS total,
@@ -1955,12 +2431,12 @@ function dealer_dashboard_summary(): void
 
 /**
  * Leads assigned to one dealer (with their tracking status).
- * Includes leads assigned either via the dashboard (dealer_lead_status)
- * or via the CRM contact assignment (contacts.assigned_to). Leads without
- * a tracking row default to non_contacted.
+ * Admin-only: reading another dealer's pipeline by id is exactly the leak this
+ * whole change exists to close, so the id no longer comes from the browser.
  */
 function dealer_leads(int $dealerId, ?string $status = null): void
 {
+    require_api_admin();
     $sql = "SELECT v.id AS contact_id, v.name, v.phone, v.email, v.business_name, v.created_at,
                    COALESCE(dls.status, 'non_contacted') AS status,
                    COALESCE(dls.response_channel, '') AS response_channel,
@@ -1990,15 +2466,20 @@ function dealer_leads(int $dealerId, ?string $status = null): void
 }
 
 /**
- * The signed-in user's OWN leads only:
+ * The signed-in user's OWN leads only.
+ *
+ * The staff id comes from the session, never from ?staff_id=, which previously
+ * let anyone read any other user's pipeline by changing the URL.
+ *
  *  - Dealer   -> leads assigned to them.
- *  - Follower -> leads assigned to them OR that they follow (never the whole
- *                managing dealer's pipeline).
- * Status tracking rows are read from the user's pipeline owner (the dealer),
- * so a follower sees exactly the status the dealer set on those leads.
+ *  - Follower -> leads assigned to them OR that they follow. They never inherit
+ *                their manager's (the Dealer's) whole book; the manager is only
+ *                used as the pipeline owner whose status column is shown.
  */
 function my_dealer_leads(int $staffId, ?string $status = null): void
 {
+    // Ignore the caller-supplied id and use the authenticated user.
+    $staffId = current_user_id();
     $row = db()->prepare('SELECT user_type, manager_id FROM staff_users WHERE id = :id');
     $row->execute([':id' => $staffId]);
     $u = $row->fetch();
@@ -2042,9 +2523,14 @@ function my_dealer_leads(int $staffId, ?string $status = null): void
     respond(['data' => $rows, 'count' => count($rows)]);
 }
 
-/** Leads that are not yet assigned to any dealer. */
+/**
+ * The unassigned lead pool. Admin-only: these leads belong to nobody yet, and
+ * dealers/followers must not be able to see or claim them before an Admin
+ * assigns them.
+ */
 function dealer_unassigned_leads(): void
 {
+    require_api_admin();
     $stmt = db()->prepare(
         "SELECT v.* FROM v_leads v
           WHERE v.assigned_to IS NULL
@@ -2070,6 +2556,9 @@ function dealer_unassigned_leads(): void
  */
 function assign_leads_to_dealer(array $body): void
 {
+    // Handing leads out is the owner's job. Previously anyone could post here
+    // and drain the unassigned pool into a dealer of their choosing.
+    require_api_admin();
     $dealerId = to_int((string)($body['dealer_id'] ?? 0));
     if ($dealerId <= 0) fail('dealer_id is required');
 
@@ -2177,6 +2666,14 @@ function update_dealer_lead_status(int $contactId, array $body): void
     $dealerId = to_int((string)($body['dealer_id'] ?? 0));
     if ($dealerId <= 0) fail('dealer_id is required');
 
+    // A dealer may only move leads on their own pipeline. Admins may act for
+    // any dealer (that is what the dashboard does). Without this check a dealer
+    // could post somebody else's dealer_id and rewrite their lead statuses.
+    if (!is_api_admin() && $dealerId !== current_user_id()) {
+        fail('You can only update leads on your own pipeline.', 403);
+    }
+    require_contact_access($contactId);
+
     $allowed = ['non_contacted', 'contacted', 'closed', 'customer', 'rejected'];
     $status = (string)($body['status'] ?? '');
     if (!in_array($status, $allowed, true)) fail('Invalid status');
@@ -2280,6 +2777,11 @@ function bulk_update_dealer_lead_status(array $body): void
     $dealerId = to_int((string)($body['dealer_id'] ?? 0));
     if ($dealerId <= 0) fail('dealer_id is required');
 
+    // Same rule as update_dealer_lead_status: your own pipeline, or Admin.
+    if (!is_api_admin() && $dealerId !== current_user_id()) {
+        fail('You can only update leads on your own pipeline.', 403);
+    }
+
     $allowed = ['non_contacted', 'contacted', 'closed', 'customer', 'rejected'];
     $status = (string)($body['status'] ?? '');
     if (!in_array($status, $allowed, true)) fail('Invalid status');
@@ -2350,17 +2852,26 @@ function bulk_update_dealer_lead_status(array $body): void
 /* ------------------- SMART LISTS (server-side, multi-user) ------------------- */
 
 /**
- * Resolve the current acting user id. Endpoints accept an explicit
- * "user_id" (the logged-in staff member) since the CRM has no session.
+ * The staff id a smart-list operation runs as.
+ *
+ * This used to read `user_id` from the request body/query, which meant anyone
+ * could act as an Admin (bypassing every ownership check downstream) or read a
+ * colleague's lists. The identity now comes from the session token and any
+ * `user_id` in the request is ignored.
  */
-function smart_list_user(array $filters, array $body = []): int
+function smart_list_user(array $filters = [], array $body = []): int
 {
-    $id = to_int((string)($body['user_id'] ?? ($filters['user_id'] ?? 0)));
-    if ($id <= 0) fail('user_id is required');
-    return $id;
+    return current_user_id();
 }
 
-/** Build the array representation of a smart list row + its shares. */
+/**
+ * Build the array representation of a smart list row + its shares.
+ *
+ * `members` is trimmed to the contacts the caller may see. A shared list keeps
+ * its name and structure for everyone, but the ids inside it are the only thing
+ * that can leak another dealer's book, so they are filtered here rather than
+ * trusted from the caller.
+ */
 function smart_list_payload(array $row): array
 {
     $shares = db()->prepare(
@@ -2369,17 +2880,33 @@ function smart_list_payload(array $row): array
     $shares->execute([':id' => $row['id']]);
     $shareIds = array_map(fn($s) => (int)$s['user_id'], $shares->fetchAll());
 
+    $members = decode_json_field($row['members'] ?? null);
+    $members = array_values(array_filter(array_map(
+        static fn($m) => is_numeric($m) ? (int)$m : 0,
+        is_array($members) ? $members : []
+    ), static fn($id) => $id > 0));
+    if (!is_api_admin()) {
+        $allowed = array_fill_keys(accessible_contact_ids(current_user_id()), true);
+        $members = array_values(array_filter($members, static fn($id) => isset($allowed[$id])));
+    }
+
+    // The share roster is staff metadata, not lead data, and only the owner (or
+    // an Admin) can change it. Showing it to everybody would tell a dealer who
+    // else a colleague's list is shared with, for no benefit.
+    $admin = is_api_admin();
+    if (!$admin) $shareIds = [];
+
     return [
         'id' => (int)$row['id'],
         'name' => $row['name'],
         'filters' => decode_json_field($row['filters'] ?? null),
         'sort_by' => $row['sort_by'] ?? '',
         'fields' => decode_json_field($row['fields'] ?? null),
-        'members' => decode_json_field($row['members'] ?? null),
+        'members' => $members,
         'dealer_id' => $row['dealer_id'] !== null ? (int)$row['dealer_id'] : null,
         'dealer_name' => $row['dealer_name'] ?? null,
         'shared_all' => (int)($row['shared_all'] ?? 0) === 1,
-        'shared_user_ids' => $shareIds,
+        'shared_user_ids' => $admin ? $shareIds : [],
         'created_by' => (int)$row['created_by'],
         'created_by_name' => $row['created_by_name'] ?? '',
         'created_at' => $row['created_at'] ?? null,
@@ -2484,15 +3011,31 @@ function smart_list_input(array $body): array
 
     $dealerId = $body['dealer_id'] ?? null;
 
+    // Sharing is an Admin decision. Without this a dealer could set shared_all
+    // and push their own list into everybody's sidebar (revealing that it
+    // exists), or assign a list to a colleague.
+    $admin = is_api_admin();
+    $shareIds = $admin ? $asIntArray($body['shared_user_ids'] ?? null) : [];
+    if (!$admin) $dealerId = null;
+
+    // Members are stored trimmed to what the caller may actually see, so the
+    // saved JSON never holds another tenant's contact ids even though the read
+    // path filters them anyway.
+    $members = $asIntArray($body['members'] ?? null);
+    if (!$admin) {
+        $allowed = array_fill_keys(accessible_contact_ids(current_user_id()), true);
+        $members = array_values(array_filter($members, static fn($id) => isset($allowed[$id])));
+    }
+
     return [
         'name' => $name,
         'filters' => encode_json_field($asStrArray($body['filters'] ?? null)),
         'sort_by' => (($body['sort_by'] ?? '') !== '') ? trim((string)$body['sort_by']) : null,
         'fields' => encode_json_field($asStrArray($body['fields'] ?? null)),
-        'members' => encode_json_field($asIntArray($body['members'] ?? null)),
+        'members' => encode_json_field($members),
         'dealer_id' => ($dealerId === null || $dealerId === '' || (int)$dealerId <= 0) ? null : (int)$dealerId,
-        'shared_all' => !empty($body['shared_all']) ? 1 : 0,
-        'share_ids' => $asIntArray($body['shared_user_ids'] ?? null),
+        'shared_all' => ($admin && !empty($body['shared_all'])) ? 1 : 0,
+        'share_ids' => $shareIds,
     ];
 }
 
@@ -2606,21 +3149,41 @@ function delete_smart_list(int $id, array $filters): void
     respond(['message' => 'Smart list deleted']);
 }
 
-/** POST /smart-lists/{id}/duplicate  { user_id } -> a copy owned by the caller. */
+/**
+ * POST /smart-lists/{id}/duplicate -> a copy owned by the caller.
+ *
+ * The source list must be one the caller can actually see, and the copy only
+ * carries the members the caller may see. Previously any list id could be
+ * copied verbatim, which handed one tenant another tenant's member ids.
+ */
 function duplicate_smart_list(int $id, array $body): void
 {
     $userId = smart_list_user([], $body);
     $pdo = db();
 
-    $src = $pdo->prepare('SELECT * FROM smart_lists WHERE id = :id');
-    $src->execute([':id' => $id]);
-    $row = $src->fetch();
-    if (!$row) fail('Smart list not found', 404);
+    // Reuse the normal visibility rule for the source list.
+    $visible = smart_lists_visible($userId);
+    $visible->execute([':me' => $userId, ':me2' => $userId]);
+    $candidates = array_values(array_filter(
+        $visible->fetchAll(),
+        static fn($r) => (int)$r['id'] === $id
+    ));
+    $candidates = filter_smart_lists_for_staff($candidates, $userId);
+    if (!$candidates) fail('Smart list not found', 404);
+    $row = $candidates[0];
 
     $name = $row['name'] . ' (copy)';
     $dup = $pdo->prepare('SELECT id FROM smart_lists WHERE created_by = :me AND name = :name');
     $dup->execute([':me' => $userId, ':name' => $name]);
     if ($dup->fetch()) fail('A smart list named "' . $name . '" already exists');
+
+    // Copy only the members the caller is allowed to see, so the new list never
+    // stores another tenant's contact ids.
+    $allowed = array_fill_keys(accessible_contact_ids($userId), true);
+    $members = array_values(array_filter(array_map(
+        static fn($m) => is_numeric($m) ? (int)$m : 0,
+        decode_json_field($row['members'] ?? null) ?: []
+    ), static fn($mid) => $mid > 0 && isset($allowed[$mid])));
 
     $pdo->prepare(
         'INSERT INTO smart_lists (name, filters, sort_by, fields, members, dealer_id, shared_all, created_by)
@@ -2630,7 +3193,7 @@ function duplicate_smart_list(int $id, array $body): void
         ':filters' => $row['filters'],
         ':sort_by' => $row['sort_by'],
         ':fields' => $row['fields'],
-        ':members' => $row['members'],
+        ':members' => json_encode($members),
         ':dealer_id' => $row['dealer_id'],
         ':created_by' => $userId,
     ]);
@@ -2879,12 +3442,19 @@ function get_form(int $id): void
     $stmt->execute([':id' => $id]);
     $row = $stmt->fetch();
     if (!$row) fail('Form not found', 404);
-    respond(['data' => form_payload($row)]);
+    $payload = form_payload($row);
+    // Internal bookkeeping - which staff member last edited the form - is not
+    // part of the rendering contract and this endpoint needs no session.
+    unset($payload['updated_by']);
+    respond(['data' => $payload]);
 }
 
 /** POST /forms { name, updated_by?, elements?, header?, cols?, campaign_id? } */
 function create_form(array $body): void
 {
+    // Form definitions are global: every public link points at them, so editing
+    // the set is an Admin-level operation rather than a personal one.
+    require_api_admin();
     ensure_forms_table();
     $name = normalize_optional($body['name'] ?? null);
     if ($name === null || $name === '') fail('Form name is required');
@@ -2912,6 +3482,7 @@ function create_form(array $body): void
 /** PUT /forms/{id} — full update of the builder form. */
 function update_form(int $id, array $body): void
 {
+    require_api_admin();
     ensure_forms_table();
     $stmt = db()->prepare('SELECT id FROM forms WHERE id = :id');
     $stmt->execute([':id' => $id]);
@@ -2960,6 +3531,7 @@ function update_form(int $id, array $body): void
 /** DELETE /forms/{id} */
 function delete_form(int $id): void
 {
+    require_api_admin();
     ensure_forms_table();
     $stmt = db()->prepare('DELETE FROM forms WHERE id = :id');
     $stmt->execute([':id' => $id]);
@@ -3043,9 +3615,12 @@ function invoice_payload(array $row): array
 }
 
 /**
- * GET /invoices[?search=&created_by=]
+ * GET /invoices[?search=]
+ *
  * Newest first; optional search across number/customer/bike/engine/chassis.
- * created_by scopes a non-admin user to their own invoices.
+ * Invoices hold customer names and amounts, so `created_by` is taken from the
+ * session: an Admin sees everything, anyone else only the invoices they raised.
+ * A `?created_by=` parameter is ignored for the same reason `restrict_to` was.
  */
 function list_invoices(array $filters): void
 {
@@ -3064,9 +3639,9 @@ function list_invoices(array $filters): void
         }
         $where[] = '(' . implode(' OR ', $pats) . ')';
     }
-    if (!empty($filters['created_by'])) {
-        $params[':created_by'] = to_int((string)$filters['created_by']);
-        $where[] = 'created_by = :created_by';
+    if (!is_api_admin()) {
+        $where[] = 'created_by = :mine';
+        $params[':mine'] = current_user_id();
     }
 
     $sql = 'SELECT * FROM invoices';
@@ -3143,7 +3718,10 @@ function create_invoice(array $body): void
         fail('An invoice with number "' . $c['invoice_no'] . '" already exists', 409);
     }
 
-    $createdBy = isset($body['created_by']) && (int)$body['created_by'] > 0 ? (int)$body['created_by'] : null;
+    // Ownership comes from the session. Honouring a body `created_by` would let
+    // a dealer file an invoice against a colleague, and since the list is scoped
+    // by this column it is also a way to hide your own invoices.
+    $createdBy = current_user_id();
 
     $stmt = db()->prepare(
         'INSERT INTO invoices (invoice_no, dated, strn, address, customer_name, qty, motorcycle, model_year,
@@ -3178,10 +3756,26 @@ function create_invoice(array $body): void
     respond(['data' => invoice_payload($get->fetch() ?: ['id' => $id]), 'message' => 'Invoice saved'], 201);
 }
 
+/**
+ * Confirm the caller may touch this invoice.
+ *
+ * Admins may edit anything; anybody else only the invoices they created. The
+ * check is done in the UPDATE/DELETE statement itself so a race cannot slip an
+ * edit through between the read and the write.
+ */
+function require_invoice_access(int $id): void
+{
+    if (is_api_admin()) return;
+    $stmt = db()->prepare('SELECT 1 FROM invoices WHERE id = :id AND created_by = :me LIMIT 1');
+    $stmt->execute([':id' => $id, ':me' => current_user_id()]);
+    if (!$stmt->fetchColumn()) fail('Invoice not found', 404);
+}
+
 /** PUT /invoices/{id} — update an existing sales tax invoice. */
 function update_invoice(int $id, array $body): void
 {
     ensure_invoices_table();
+    require_invoice_access($id);
     $existing = db()->prepare('SELECT id FROM invoices WHERE id = :id');
     $existing->execute([':id' => $id]);
     if ($existing->fetchColumn() === false) fail('Invoice not found', 404);
@@ -3231,6 +3825,7 @@ function update_invoice(int $id, array $body): void
 function delete_invoice(int $id): void
 {
     ensure_invoices_table();
+    require_invoice_access($id);
     $stmt = db()->prepare('DELETE FROM invoices WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) fail('Invoice not found', 404);
@@ -3419,7 +4014,10 @@ function create_submission(array $body): void
         ':order' => $f['order_number'],
         ':problem' => $f['problem_category'],
         ':reason' => $f['reason'],
-        ':created_by' => isset($body['created_by']) && (int)$body['created_by'] > 0 ? (int)$body['created_by'] : null,
+        // Recorded from the session, never from the body: this endpoint is
+        // public, so a caller-supplied created_by would let anyone forge the
+        // audit trail ("this was submitted by staff #7").
+        ':created_by' => api_current_user() !== null ? current_user_id() : null,
     ]);
 
     // Always acknowledge the person who filled in the form on THEIR email
@@ -3476,8 +4074,11 @@ function create_submission(array $body): void
 }
 
 /**
- * GET /submissions?type=&assigned_to=&restrict_to=&search=
- * restrict_to locks a non-admin viewer to only what is assigned to them.
+ * GET /submissions?type=&assigned_to=&search=
+ *
+ * Dealers/followers see only the inquiries assigned to them; unassigned
+ * submissions stay with the Admin until somebody hands them over. The lock is
+ * applied from the session, not from a `restrict_to` parameter.
  */
 function list_submissions(array $filters): void
 {
@@ -3496,11 +4097,10 @@ function list_submissions(array $filters): void
             $params[':aid'] = $aid;
         }
     }
-    if (!empty($filters['restrict_to'])) {
-        // Dealers only ever see inquiries assigned to them.
-        $rid = to_int((string)$filters['restrict_to']);
+    // Tenancy from the session; a ?restrict_to= parameter is ignored.
+    if (!is_api_admin()) {
         $where[] = 's.assigned_to = :rid';
-        $params[':rid'] = $rid;
+        $params[':rid'] = current_user_id();
     }
     if (!empty($filters['search'])) {
         $term = '%' . $filters['search'] . '%';
@@ -3527,6 +4127,9 @@ function list_submissions(array $filters): void
 /** POST /submissions/{id}/assign { assigned_to } -> assign/unassign a dealer. */
 function assign_submission(int $id, array $body): void
 {
+    // Handing an inquiry to a dealer decides whose book it lands in, so only an
+    // Admin may do it.
+    require_api_admin();
     ensure_portal_submissions_table();
     $dealerId = to_int((string)($body['assigned_to'] ?? 0));
 
@@ -3585,6 +4188,12 @@ function assign_submission(int $id, array $body): void
 function delete_submission(int $id): void
 {
     ensure_portal_submissions_table();
+    // A non-Admin may only discard an inquiry sitting in their own book.
+    if (!is_api_admin()) {
+        $own = db()->prepare('SELECT 1 FROM portal_submissions WHERE id = :id AND assigned_to = :me LIMIT 1');
+        $own->execute([':id' => $id, ':me' => current_user_id()]);
+        if (!$own->fetchColumn()) fail('Submission not found', 404);
+    }
     db()->prepare('DELETE FROM portal_submissions WHERE id = :id')->execute([':id' => $id]);
     respond(['message' => 'Submission deleted']);
 }
@@ -3664,12 +4273,70 @@ $filters = $_GET;
 
 $resource = $parts[0] ?? 'contacts';
 
+/* ------------------------- AUTH GATE -------------------------
+ *
+ * Everything below the switch is CRM data, so it requires a session. The
+ * only exceptions are the endpoints a public website form or a dealer
+ * registration page has to reach without logging in.
+ *
+ * Before this gate the API trusted a `restrict_to` / `user_id` query
+ * parameter for its visibility rules, so any caller — signed in or not —
+ * could ask for somebody else's data or read the whole book.
+ */
+$publicRoutes = [
+    // Signed-in endpoints under /auth (logout, me, reveal-password) still
+    // require a session; these three are reachable without one.
+    'auth'          => ['login', 'magic-login', 'register-dealer'],
+    'public'        => [null],
+    'submissions'   => [null],   // POST only; see below
+    'form-images'   => [null],
+    'forms'         => [null],
+    'health'        => [null],
+];
+$publicSub = $publicRoutes[$resource] ?? null;
+$isPublic = $publicSub !== null;
+if ($isPublic && $resource === 'submissions' && $method !== 'POST') {
+    // Reading, assigning or deleting submissions is CRM work.
+    $isPublic = false;
+}
+if ($isPublic && $resource === 'public' && !($method === 'POST' && ($parts[1] ?? null) === 'leads')) {
+    // Only "post a website form lead" is public; nothing else under /public.
+    fail('Not found', 404);
+}
+if ($isPublic && $resource === 'forms' && !($method === 'GET' && isset($parts[1]))) {
+    // Only fetching one form definition by id is public (the renderer needs it).
+    // Listing, creating, editing and deleting forms are all CRM work.
+    $isPublic = false;
+}
+if ($isPublic && $resource === 'form-images' && $method === 'POST') {
+    // Uploading an image belongs to the form builder, not the public form.
+    $isPublic = false;
+}
+if ($isPublic && $resource === 'auth' && $sub = ($parts[1] ?? null)) {
+    // /auth/logout, /auth/me and /auth/reveal-password are session endpoints,
+    // so they fall through to the normal gate; anything else unknown 404s.
+    if (in_array($sub, ['logout', 'me', 'reveal-password'], true)) {
+        $isPublic = false;
+    } elseif (!in_array($sub, $publicSub, true)) {
+        fail('Unknown auth endpoint', 404);
+    }
+}
+if (!$isPublic) {
+    require_api_user();
+}
+
 // Soft-delete support: DELETE keeps the DB row (deleted_at), views hide it.
 if (in_array($resource, ['contacts', 'leads', 'maintenance'], true)) {
     ensure_soft_delete_support();
 }
 
 switch ($resource) {
+    case 'public':
+        if ($method === 'POST' && ($parts[1] ?? null) === 'leads') {
+            create_public_lead(json_body());
+        }
+        break;
+
     case 'contacts':
         if ($method === 'GET') {
             $id = $parts[1] ?? null;
@@ -3741,6 +4408,9 @@ switch ($resource) {
         $id = $parts[1] ?? null;
         if ($method === 'GET') {
             if ($id) {
+                // Fetching a staff row returns permissions and profile data, so
+                // it is Admin-only; the client's own row comes from /auth/me.
+                require_api_admin();
                 $rows = db()->query('SELECT * FROM staff_users WHERE id = ' . (int)$id)->fetchAll();
                 if (!$rows) fail('Staff user not found', 404);
                 respond(['data' => staff_payload($rows[0])]);
@@ -3786,6 +4456,9 @@ switch ($resource) {
         break;
 
     case 'maintenance':
+        // Global data surgery (mass renames, restoring anybody's deleted record,
+        // reading the archive across every tenant) is Admin-only.
+        require_api_admin();
         if ($method === 'POST' && ($parts[1] ?? null) === 'repair-imported-names') {
             repair_imported_names();
         }
@@ -3822,16 +4495,20 @@ switch ($resource) {
             http_response_code(204);
             exit;
         }
-        if ($method !== 'POST') {
+        if ($method !== 'POST' && $method !== 'GET') {
             fail('Only POST is allowed on /auth', 405);
         }
         $sub = $parts[1] ?? null;
-        if ($sub === 'register-dealer') {
+        if ($sub === null && $method === 'GET') {
+            auth_me();
+        } elseif ($sub === 'register-dealer') {
             register_dealer(json_body());
         } elseif ($sub === 'reveal-password') {
             reveal_password(json_body());
         } elseif ($sub === 'magic-login') {
             magic_login(json_body());
+        } elseif ($sub === 'logout') {
+            logout();
         } else {
             login(json_body());
         }
@@ -3841,17 +4518,19 @@ switch ($resource) {
         $sub = $parts[1] ?? null;
         if ($method === 'GET') {
             if ($sub === 'summary') {
+                // Admin-only inside: aggregates every dealer at once.
                 dealer_dashboard_summary();
             } elseif ($sub === 'unassigned') {
+                // Admin-only inside: the pool nobody owns yet.
                 dealer_unassigned_leads();
             } elseif ($sub === 'leads') {
+                // Admin-only inside: reading another dealer's pipeline.
                 $dealerId = to_int((string)($filters['dealer_id'] ?? 0));
                 if ($dealerId <= 0) fail('dealer_id is required');
                 dealer_leads($dealerId, isset($filters['status']) ? (string)$filters['status'] : null);
             } elseif ($sub === 'my-leads') {
-                $staffId = to_int((string)($filters['staff_id'] ?? 0));
-                if ($staffId <= 0) fail('staff_id is required');
-                my_dealer_leads($staffId, isset($filters['status']) ? (string)$filters['status'] : null);
+                // The staff id is taken from the session, not from ?staff_id=.
+                my_dealer_leads(current_user_id(), isset($filters['status']) ? (string)$filters['status'] : null);
             } else {
                 fail('Unknown sub-resource', 404);
             }
@@ -3895,9 +4574,10 @@ switch ($resource) {
     case 'notifications':
         if ($method === 'GET') {
             if (($parts[1] ?? null) === 'unread-count') {
-                notifications_unread_count(to_int((string)($filters['staff_id'] ?? 0)));
+                notifications_unread_count();
+            } else {
+                list_notifications($filters);
             }
-            list_notifications($filters);
         } elseif ($method === 'POST') {
             if (($parts[1] ?? null) === 'read-all') {
                 mark_all_notifications_read(json_body());
@@ -3979,28 +4659,22 @@ switch ($resource) {
         break;
 
     case 'health':
+        // Reachable without a session, so it must not disclose infrastructure:
+        // only "is the app alive", never DB credentials, hosts or row counts.
         $info = [
+            'status' => 'ok',
             'php' => PHP_VERSION,
-            'sapi' => php_sapi_name(),
-            'server_software' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown',
-            'db_host' => DB_HOST,
-            'db_name' => DB_NAME,
-            'db_user' => DB_USER,
-            'db_port' => DB_PORT,
-            'doc_root' => $_SERVER['DOCUMENT_ROOT'] ?? 'unknown',
-            'script_name' => $_SERVER['SCRIPT_NAME'] ?? 'unknown',
-            'request_uri' => $_SERVER['REQUEST_URI'] ?? 'unknown',
         ];
-        try {
+// New account only (an existing address returned above).
+    $plain = generate_strong_password();
+    $hash = hash_password($plain);
+
+    try {
             $pdo = db();
+            $pdo->query('SELECT 1');
             $info['db_status'] = 'connected';
-            $row = $pdo->query('SELECT COUNT(*) AS c FROM contacts')->fetch();
-            $info['contact_count'] = (int)($row['c'] ?? 0);
-            $row2 = $pdo->query('SELECT COUNT(*) AS c FROM staff_users')->fetch();
-            $info['staff_count'] = (int)($row2['c'] ?? 0);
         } catch (Throwable $e) {
             $info['db_status'] = 'error';
-            $info['db_error'] = $e->getMessage();
         }
         respond($info);
         break;

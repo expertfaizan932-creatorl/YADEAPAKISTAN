@@ -41,7 +41,9 @@ function cors(): void
 {
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
+    // Authorization carries the session token, X-Acting-As is the Admin-only
+    // "Login as" impersonation header. Both must survive the preflight.
+    header('Access-Control-Allow-Headers: Content-Type, X-Requested-With, Authorization, X-Acting-As');
     header('Content-Type: application/json; charset=utf-8');
     if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
         http_response_code(204);

@@ -1670,7 +1670,8 @@ function MagicLoginHandler({ token }: { token: string }) {
       .magicLogin(token)
       .then((res) => {
         if (!active) return;
-        completeLogin(res.data);
+        if (!res.token) throw new Error('Login did not return a session token.');
+        completeLogin(res.data, res.token);
         navigate({ name: 'dashboard' });
       })
       .catch((err) => {

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ApiStaffUser, LoginInput, StaffInput } from './api';
-import { api } from './api';
+import { ApiError, api, setActingAsStaffId, setAuthToken } from './api';
 
 /**
  * AuthProvider owns the "who is logged in" state for the whole app.
@@ -9,11 +9,20 @@ import { api } from './api';
  * user signed in. Roles & permissions come straight from the staff_users
  * record that was selected when the user was created (Settings -> My Staff),
  * so after login the user only sees/does what was enabled for them.
+ *
+ * The bearer token is kept *with* the user, not just the user object: the
+ * server derives every visibility rule from that token, so a user object alone
+ * would let the UI show buttons the API would rightly reject.
  */
 
 const SESSION_KEY = 'evee_auth_session_v1';
 /** Holds the real admin while an admin is using "Login as" to view another user. */
 const IMPERSONATION_KEY = 'evee_impersonation_v1';
+
+interface StoredSession {
+  user: ApiStaffUser;
+  token: string;
+}
 
 interface AuthContextValue {
   /** The logged-in staff user (null when signed out). */
@@ -23,10 +32,10 @@ interface AuthContextValue {
   isImpersonating: boolean;
   login: (input: LoginInput) => Promise<ApiStaffUser>;
   /**
-   * Install an already-fetched staff user as the active session (used by the
-   * one-click magic-login link in approval emails).
+   * Install an already-fetched staff user + session token as the active
+   * session (used by the one-click magic-login link in approval emails).
    */
-  completeLogin: (user: ApiStaffUser) => void;
+  completeLogin: (user: ApiStaffUser, token: string) => void;
   logout: () => void;
   /** Admin-only: switch the session to another staff user (any role). */
   loginAs: (staffId: number) => Promise<ApiStaffUser>;
@@ -61,80 +70,140 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-function readStored(key: string): ApiStaffUser | null {
+function readStored(key: string): StoredSession | null {
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
-    return JSON.parse(raw) as ApiStaffUser;
+    const parsed = JSON.parse(raw) as Partial<StoredSession>;
+    // A session without a token is unusable - the API rejects it - so treat it
+    // as signed out rather than pretending the user is still logged in.
+    if (!parsed?.token || !parsed?.user?.id) return null;
+    return parsed as StoredSession;
   } catch {
     return null;
   }
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<ApiStaffUser | null>(() => readStored(SESSION_KEY));
+  const [session, setSession] = useState<StoredSession | null>(() => readStored(SESSION_KEY));
   const [originalUser, setOriginalUser] = useState<ApiStaffUser | null>(() =>
-    readStored(IMPERSONATION_KEY)
+    readStored(IMPERSONATION_KEY)?.user ?? null
   );
   const [loading, setLoading] = useState(false);
 
+  const user = session?.user ?? null;
+  const token = session?.token ?? null;
+  const isImpersonating = originalUser !== null;
+
   useEffect(() => {
     try {
-      if (user) localStorage.setItem(SESSION_KEY, JSON.stringify(user));
+      if (session) localStorage.setItem(SESSION_KEY, JSON.stringify(session));
       else localStorage.removeItem(SESSION_KEY);
     } catch {
       /* ignore storage errors */
     }
-  }, [user]);
+  }, [session]);
 
   useEffect(() => {
     try {
-      if (originalUser) localStorage.setItem(IMPERSONATION_KEY, JSON.stringify(originalUser));
-      else localStorage.removeItem(IMPERSONATION_KEY);
+      // Stored in the same {user, token} shape as the session so it survives a
+      // page refresh: without the token the Admin could not be restored, and
+      // worse, the app would forget it is impersonating and would silently keep
+      // the Admin's own (unscoped) view.
+      if (originalUser && token) {
+        localStorage.setItem(IMPERSONATION_KEY, JSON.stringify({ user: originalUser, token }));
+      } else {
+        localStorage.removeItem(IMPERSONATION_KEY);
+      }
     } catch {
       /* ignore storage errors */
     }
-  }, [originalUser]);
+  }, [originalUser, token]);
+
+  /**
+   * Keep the API client in step with the session on every change, including the
+   * very first render after a page load.
+   */
+  useEffect(() => {
+    setAuthToken(token);
+    // While impersonating, the token is still the Admin's; the header tells the
+    // server whose data to scope the response to.
+    setActingAsStaffId(isImpersonating && user ? user.id : null);
+  }, [token, user, isImpersonating]);
+
+  /**
+   * Confirm the stored token is still good. An expired or revoked token (401)
+   * signs the user out; a network hiccup or 500 must not, so we stay signed in
+   * and let the next request surface the problem.
+   */
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.me();
+        if (cancelled) return;
+        setSession((prev) => (prev ? { ...prev, user: res.data } : prev));
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          setSession(null);
+          setOriginalUser(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
 
   const login = useCallback(async (input: LoginInput): Promise<ApiStaffUser> => {
     setLoading(true);
     try {
       const res = await api.login(input);
+      if (!res.token) throw new Error('Login did not return a session token.');
       setOriginalUser(null);
-      setUser(res.data);
+      setSession({ user: res.data, token: res.token });
       return res.data;
     } finally {
       setLoading(false);
     }
   }, []);
 
-  const completeLogin = useCallback((u: ApiStaffUser) => {
+  const completeLogin = useCallback((u: ApiStaffUser, t: string) => {
+    if (!t) throw new Error('Login did not return a session token.');
     setOriginalUser(null);
-    setUser(u);
+    setSession({ user: u, token: t });
   }, []);
 
   const logout = useCallback(() => {
-    setUser(null);
+    // Revoke on the server, but never let a failing request trap the user in a
+    // session they have already chosen to leave.
+    void api.logout().catch(() => undefined);
+    setSession(null);
     setOriginalUser(null);
   }, []);
 
   const loginAs = useCallback(
     async (staffId: number): Promise<ApiStaffUser> => {
       if (!user || user.user_type !== 'Admin') throw new Error('Only admins can use "Login as".');
+      if (!token) throw new Error('Session expired. Please sign in again.');
       const res = await api.getStaff(staffId);
       if (!res.data) throw new Error('Staff user not found');
+      // Keep the Admin's token: the X-Acting-As header set by the effect above
+      // is what switches the scope, so the Admin can still come back.
       setOriginalUser(user);
-      setUser(res.data);
+      setSession({ user: res.data, token });
       return res.data;
     },
-    [user]
+    [user, token]
   );
 
   const switchBack = useCallback(() => {
-    if (!originalUser) return;
-    setUser(originalUser);
+    if (!originalUser || !token) return;
+    setSession({ user: originalUser, token });
     setOriginalUser(null);
-  }, [originalUser]);
+  }, [originalUser, token]);
 
   const updateUser = useCallback(
     async (changes: StaffInput): Promise<ApiStaffUser> => {
@@ -158,8 +227,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         ...changes,
       };
       await api.updateStaff(user.id, payload);
-      const fresh = await api.getStaff(user.id);
-      setUser(fresh.data);
+      // /auth/me rather than /staff/{id}: reading another staff row is an
+      // Admin-only endpoint, and this must work for a dealer editing their own
+      // profile. It also respects impersonation, so it returns the right user.
+      const fresh = await api.me();
+      setSession((prev) => (prev ? { ...prev, user: fresh.data } : prev));
       return fresh.data;
     },
     [user]

@@ -257,7 +257,7 @@ export default function PublicFormPage({ data, formId }: { data?: string; formId
         if (v && v.trim()) filled[el.label] = v.trim();
       }
 
-      const res = await api.createContact({
+      const res = await api.submitPublicLead({
         first_name: firstName || undefined,
         last_name: lastName || undefined,
         name,
@@ -326,7 +326,7 @@ export default function PublicFormPage({ data, formId }: { data?: string; formId
             setCountdown(5);
             // Fresh registrations wait for an admin to approve the account;
             // only already-approved dealers are signed in automatically.
-            setPendingApproval((reg.data.approved ?? 1) !== 1);
+            setPendingApproval((reg.data?.approved ?? 1) !== 1);
           }
         } catch {
           /* ignore — the submission itself succeeded */

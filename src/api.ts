@@ -343,10 +343,16 @@ export interface LoginInput {
   password: string;
 }
 
-/** Response of POST /auth/register-dealer (public dealership form signup). */
+/**
+ * Response of POST /auth/register-dealer (public dealership form signup).
+ *
+ * `password` is only ever populated for a brand new account. When the address is
+ * already registered the server mails the credentials to that address instead
+ * of returning them, so both `data` and `password` come back null.
+ */
 export interface DealerRegistrationResult {
-  data: ApiStaffUser;
-  /** Working password for the account (generated or existing). */
+  data: ApiStaffUser | null;
+  /** Working password, for a newly created account only. */
   password: string | null;
   message: string;
 }
@@ -500,18 +506,56 @@ export const API_BASE = (() => {
 
 let workingBase: string | null = null;
 
+/**
+ * The bearer token from the last login. The server derives all visibility from
+ * it, so it is what keeps a dealer inside their own book - never a query
+ * parameter the browser can edit. Held in a module variable rather than read
+ * from localStorage on every call so that a logout cannot be half-applied.
+ */
+let authToken: string | null = null;
+
+/** Admin impersonation: sent as X-Acting-As while `authToken` stays the Admin's. */
+let actingAsStaffId: number | null = null;
+
+export function setAuthToken(token: string | null): void {
+  authToken = token;
+}
+
+export function setActingAsStaffId(staffId: number | null): void {
+  actingAsStaffId = staffId;
+}
+
+/** An error that came back from the API, with the HTTP status attached. */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const bases = Array.from(
     new Set([workingBase, API_BASE].concat(detectApiBases()).filter(Boolean) as string[])
   );
+
+  const authHeaders: Record<string, string> = {};
+  if (authToken) authHeaders.Authorization = `Bearer ${authToken}`;
+  if (actingAsStaffId !== null) authHeaders['X-Acting-As'] = String(actingAsStaffId);
 
   let lastErr: Error | null = null;
 
   for (const base of bases) {
     try {
       const res = await fetch(`${base}${path}`, {
-        headers: { 'Content-Type': 'application/json' },
         ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+          ...(options.headers as Record<string, string> | undefined),
+        },
       });
 
       const text = await res.text();
@@ -537,14 +581,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       }
 
       // A JSON body means we reached the real API (e.g. a 4xx/5xx error),
-      // so surface that error instead of trying other bases.
+      // so surface that error instead of trying other bases. The status is kept
+      // so callers can tell "your session expired" (401/403) apart from a real
+      // failure like a dead server, which must NOT sign the user out.
       if (payload !== null) {
         const msg = (payload as { error?: string })?.error ?? `HTTP ${res.status}`;
-        throw new Error(msg);
+        throw new ApiError(msg, res.status);
       }
 
       lastErr = new Error(`Invalid JSON from ${base}${path} (HTTP ${res.status})`);
     } catch (err) {
+      // A real API response (even a 4xx) proves this base is correct, so do not
+      // waste time probing the other candidates.
+      if (err instanceof ApiError) throw err;
       lastErr = err as Error;
     }
   }
@@ -580,6 +629,18 @@ export const api = {
 
   createContact: (input: CreateContactInput) =>
     request<{ data: { id: number }; message: string }>('/contacts', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /**
+   * Website form submission. Reachable without a session, so it uses the
+   * dedicated public endpoint rather than /contacts (which is now
+   * authenticated). The server forces the lead to be unassigned and never
+   * merges it into an existing contact.
+   */
+  submitPublicLead: (input: CreateContactInput) =>
+    request<{ data: { id: number }; message: string }>('/public/leads', {
       method: 'POST',
       body: JSON.stringify(input),
     }),
@@ -697,17 +758,30 @@ export const api = {
 
   /* ------------------- AUTH ------------------- */
 
+  /**
+   * Password login. The response carries the signed-in staff user *and* a
+   * bearer token; keep both. The token is the identity the server trusts.
+   */
   login: (input: LoginInput) =>
-    request<{ data: ApiStaffUser; message: string }>('/auth', {
+    request<{ data: ApiStaffUser; token?: string; message: string }>('/auth', {
       method: 'POST',
       body: JSON.stringify(input),
     }),
 
-  /**
-   * Find-or-create the Dealer staff account for a dealership registration
-   * submission. Returns the account together with its working password so
-   * the public form page can log the new dealer in automatically.
-   */
+  /** The signed-in user, read back from the token (used to validate on boot). */
+  me: () => request<{ data: ApiStaffUser }>('/auth'),
+
+  /** Revokes this token on the server so it can never be reused. */
+  logout: () => request<{ message: string }>('/auth/logout', { method: 'POST' }),
+
+/**
+ * Find-or-create the Dealer staff account for a dealership registration
+ * submission. For a brand new account it also returns the working password, so
+ * the public form page can log that dealer in automatically. When the address
+ * already exists the server emails the credentials instead and returns
+ * `password: null` - it never hands an existing account's password back over
+ * HTTP.
+ */
   registerDealer: (input: DealerRegistrationInput) =>
     request<DealerRegistrationResult>('/auth/register-dealer', {
       method: 'POST',
@@ -720,7 +794,7 @@ export const api = {
    * accounts that are still pending admin approval.
    */
   magicLogin: (token: string) =>
-    request<{ data: ApiStaffUser; message: string }>('/auth/magic-login', {
+    request<{ data: ApiStaffUser; token?: string; message: string }>('/auth/magic-login', {
       method: 'POST',
       body: JSON.stringify({ token }),
     }),
