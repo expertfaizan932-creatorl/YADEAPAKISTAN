@@ -5,6 +5,7 @@ import { logActivity } from '../data/activityLog';
 import { ensureCampaignsLoaded, campaignNameById } from '../data/campaigns';
 import { deserializeFormFromUrl, type PublicFormPayload } from '../utils';
 import { recordFormSubmission } from '../data/formsStore';
+import { detectFormSource } from '../data/contactSource';
 import { useAuth } from '../auth';
 import { navigate } from '../router';
 import { LocalDropdownRowsField, childOptionsFor, type LocalDropdownRow } from './LocalDropdownSettings';
@@ -231,6 +232,15 @@ export default function PublicFormPage({ data, formId }: { data?: string; formId
       if (!name) name = 'Form Lead';
 
       const submittedAt = new Date().toISOString();
+      // Where the visitor came from, resolved once per page view so it cannot
+      // change mid-submission. Facebook/Instagram/Google ads all report a
+      // referrer, so simply dropping the form link into a campaign is enough.
+      const leadSource = detectFormSource({
+        referrer: typeof document === 'undefined' ? '' : document.referrer,
+        search: typeof window === 'undefined' ? '' : window.location.search,
+        formName: form.name,
+        campaignName: form.campaignId ? campaignNameById(form.campaignId) : '',
+      });
       const filled: Record<string, string> = {};
       for (const el of form.elements) {
         if (el.type === 'button') continue;
@@ -256,7 +266,20 @@ export default function PublicFormPage({ data, formId }: { data?: string; formId
         business_name: business || undefined,
         contact_type: 'Lead',
         tags: ['lead', form.name],
-        custom_fields: { form_submissions: [{ formName: form.name, submittedOn: submittedAt, values: filled }] },
+        custom_fields: {
+          // Auto-detected from the referrer/utm the visitor arrived with, so the
+          // lead's Contact source is already correct in the CRM — staff never
+          // have to pick it by hand. Left empty when nothing can be determined.
+          ...(leadSource ? { source: leadSource } : {}),
+          form_submissions: [
+            {
+              formName: form.name,
+              submittedOn: submittedAt,
+              ...(leadSource ? { source: leadSource } : {}),
+              values: filled,
+            },
+          ],
+        },
       });
 
       recordFormSubmission(form.name, form.elements);

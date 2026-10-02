@@ -27,6 +27,8 @@ export interface Contact {
 export interface FormSubmissionData {
   formName: string;
   submittedOn?: string;
+  /** Platform the submission arrived from (auto-detected on the public form). */
+  source?: string;
   values: Record<string, string>;
 }
 

@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ApiContact, ApiFollower } from '../api';
 import { api } from '../api';
 import { formatDbDate, initialsFromName, fileToResizedDataUrl, formSubmissionsOf } from '../utils';
+import {
+  CONTACT_SOURCES as BASE_CONTACT_SOURCES,
+  resolveContactSource,
+} from '../data/contactSource';
 import { countryCodes } from '../data/formOptions';
 import { TIMEZONES } from '../data/timezones';
 import { useStaff } from '../StaffContext';
@@ -52,21 +56,7 @@ const DND_CHANNELS: { key: keyof DndState; label: string }[] = [
   { key: 'whatsapp', label: 'WhatsApp' },
 ];
 
-const CONTACT_SOURCES = [
-  'Website',
-  'Facebook',
-  'Instagram',
-  'TikTok',
-  'Google',
-  'Referral',
-  'Walk-In',
-  'Phone Call',
-  'Email',
-  'SMS',
-  'WhatsApp',
-  'Event',
-  'Other',
-];
+const CONTACT_SOURCES: string[] = [...BASE_CONTACT_SOURCES];
 
 interface ContactInfoPanelProps {
   contact: ApiContact;
@@ -295,12 +285,21 @@ function ContactInfoPanel({ contact, onBack, onNotify, onOpenDrawer, onAvatarUpd
       postal: (cf['postal_code'] as string) || '',
       language: (cf['language'] as string) || '',
       timezone: (cf['timezone'] as string) || '',
-      source: (cf['source'] as string) || '',
+      source: resolveContactSource(cf).value,
       contactType: contact.contact_type || '',
       business: contact.business_name || '',
       website: (cf['website'] as string) || '',
     };
   });
+
+  // Leads captured from a public form have no stored source — it is derived
+  // from the submission so the dropdown shows the real platform without anyone
+  // having to set it. `auto` marks a value nobody picked by hand.
+  const derivedSource = useMemo(() => resolveContactSource(contact.custom_fields), [contact.custom_fields]);
+  const sourceOptions = useMemo(() => {
+    if (!derivedSource.value || CONTACT_SOURCES.includes(derivedSource.value)) return CONTACT_SOURCES;
+    return [...CONTACT_SOURCES, derivedSource.value];
+  }, [derivedSource.value]);
 
   const [emails, setEmails] = useState<{ id: number; value: string }[]>([
     { id: 1, value: contact.email || '' },
@@ -325,7 +324,7 @@ function ContactInfoPanel({ contact, onBack, onNotify, onOpenDrawer, onAvatarUpd
       postal: (cf['postal_code'] as string) || '',
       language: (cf['language'] as string) || '',
       timezone: (cf['timezone'] as string) || '',
-      source: (cf['source'] as string) || '',
+      source: resolveContactSource(cf).value,
       contactType: contact.contact_type || '',
       business: contact.business_name || '',
       website: (cf['website'] as string) || '',
@@ -752,15 +751,30 @@ function ContactInfoPanel({ contact, onBack, onNotify, onOpenDrawer, onAvatarUpd
                   <input type="date" value={fields.dob} onChange={set('dob')} className={inputCls} />
                 </div>
                 <div>
-                  <label className={labelCls}>Contact source</label>
+                  <div className="flex items-center justify-between">
+                    <label className={labelCls}>Contact source</label>
+                    {derivedSource.auto && derivedSource.value && (
+                      <span
+                        className="text-[9px] font-semibold text-blue-600 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full"
+                        title={`Auto-detected from the "${derivedSource.fromForm}" form`}
+                      >
+                        Auto
+                      </span>
+                    )}
+                  </div>
                   <select value={fields.source} onChange={set('source')} className={inputCls}>
                     <option value="">--</option>
-                    {CONTACT_SOURCES.map((s) => (
+                    {sourceOptions.map((s) => (
                       <option key={s} value={s}>
                         {s}
                       </option>
                     ))}
                   </select>
+                  {derivedSource.auto && derivedSource.value && (
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Detected from the {derivedSource.fromForm} form
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className={labelCls}>Contact type</label>

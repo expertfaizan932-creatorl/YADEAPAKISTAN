@@ -3,6 +3,7 @@ import type { Contact } from '../types';
 import type { FilterGroup } from './smartListOptions';
 import { getForms, type StoredForm } from './formsStore';
 import { getImportColumns } from './importColumnsStore';
+import { resolveContactSource } from './contactSource';
 import { findCustomValue } from '../utils';
 import Avatar from '../components/Avatar';
 import Tag from '../components/Tag';
@@ -253,7 +254,10 @@ export const TABLE_FIELDS: Record<string, TableField> = {
     id: 'contact_source',
     label: 'Contact source',
     group: 'contact',
-    render: (c) => customText(c, 'Contact source'),
+    // Resolved rather than read by label: the stored key is "source", and
+    // leads from a public form carry no stored value at all — it is derived
+    // from the submission.
+    render: (c) => resolveContactSource(c.customFields).value,
   },
   contact_type: {
     id: 'contact_type',
