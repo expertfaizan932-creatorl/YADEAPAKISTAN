@@ -128,6 +128,55 @@ jobs:
           CFG=/etc/nginx/sites-enabled/biztrack-yadea
           cp "$CFG" /tmp/biztrack-yadea.bak
 
+          # Turn on compression. Without this nginx ships the 1.7 MB JS bundle and
+          # every multi-megabyte JSON list response uncompressed, which is what made
+          # the CRM feel slow on anything but a fast connection. gzip takes the
+          # bundle to roughly a quarter of its size and the JSON payloads to about a
+          # tenth. The block is inserted inside the server{} block, before
+          # "location /", and is marked so re-running the deploy is a no-op.
+          if grep -q "# yadea compression (managed by deploy)" "$CFG"; then
+              echo GZIP_ALREADY_PATCHED
+          else
+              cat > /tmp/yadea-gzip.conf << 'BLOCK'
+          # yadea compression (managed by deploy)
+          gzip on;
+          gzip_vary on;
+          gzip_proxied any;
+          gzip_comp_level 5;
+          gzip_min_length 512;
+          gzip_types
+              text/plain
+              text/css
+              text/xml
+              text/javascript
+              application/javascript
+              application/x-javascript
+              application/json
+              application/manifest+json
+              application/xml
+              image/svg+xml;
+
+          BLOCK
+              python3 - "$CFG" /tmp/yadea-gzip.conf << 'PY'
+          import sys
+          path, snip = sys.argv[1], sys.argv[2]
+          with open(snip, encoding='utf-8') as f:
+              block = f.read()
+          with open(path, encoding='utf-8') as f:
+              lines = f.readlines()
+          for i, line in enumerate(lines):
+              if line.strip().startswith('location / {'):
+                  lines[i:i] = [block]
+                  break
+          else:
+              raise SystemExit('no "location /" block found to anchor the gzip config')
+          with open(path, 'w', encoding='utf-8') as f:
+              f.writelines(lines)
+          PY
+              rm -f /tmp/yadea-gzip.conf
+              echo GZIP_PATCHED
+          fi
+
           if grep -q "# yadea static assets (managed by deploy)" "$CFG"; then
               echo NGINX_ALREADY_PATCHED
           else

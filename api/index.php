@@ -129,9 +129,94 @@ function order_clause(array $filters): string
     return sprintf(' ORDER BY %s %s', $sort, $dir);
 }
 
+/**
+ * Followers for a whole page of contacts in ONE query.
+ *
+ * list_contacts() used to call contact_followers() once per row, so a 3,000
+ * contact page meant 3,000 sequential round trips: 48 seconds on the live box
+ * and a browser timeout ("Failed to fetch") long before that. One grouped
+ * query does the same work in a single pass.
+ */
+function contact_followers_map(array $contactIds): array
+{
+    $map = [];
+    foreach (array_unique(array_map('intval', $contactIds)) as $id) $map[$id] = [];
+    if (!$map) return $map;
+
+    // Chunked so a huge page cannot build a statement past max_allowed_packet.
+    foreach (array_chunk(array_keys($map), 500) as $chunk) {
+        $in = implode(',', array_fill(0, count($chunk), '?'));
+        $stmt = db()->prepare(
+            "SELECT cf.contact_id, s.id, s.first_name, s.last_name, s.full_name, s.user_type, s.avatar_data
+               FROM contact_followers cf
+               JOIN staff_users s ON s.id = cf.staff_id
+              WHERE cf.contact_id IN ($in)
+              ORDER BY s.full_name"
+        );
+        $stmt->execute($chunk);
+        foreach ($stmt->fetchAll() as $r) {
+            $cid = (int)$r['contact_id'];
+            unset($r['contact_id']);
+            $map[$cid][] = $r;
+        }
+    }
+    return $map;
+}
+
+/**
+ * Indexes the contact list depends on.
+ *
+ * Every scoped contacts query filters on assigned_to/deleted_at and the tag
+ * joins need contact_tags(contact_id). Without them the scope check degrades
+ * into a full table scan per request, which is what made the CRM crawl.
+ *
+ * Idempotent: asks information_schema once for the index names that already
+ * exist and only creates what is missing, so this is safe on every request and
+ * a failure here is never fatal - it just leaves the query unindexed.
+ */
+function ensure_list_indexes(): void
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+
+    $wanted = [
+        'contacts' => [
+            'idx_contacts_assigned_deleted' => '(assigned_to, deleted_at)',
+            'idx_contacts_deleted_activity' => '(deleted_at, last_activity_at)',
+            'idx_contacts_lead_type' => '(is_lead, contact_type)',
+        ],
+        'contact_tags' => [
+            'idx_contact_tags_contact' => '(contact_id)',
+            'idx_contact_tags_tag' => '(tag_id)',
+        ],
+    ];
+
+    try {
+        $pdo = db();
+        $have = [];
+        $stmt = $pdo->prepare(
+            'SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (:a, :b)'
+        );
+        $stmt->execute([':a' => 'contacts', ':b' => 'contact_tags']);
+        foreach ($stmt->fetchAll() as $r) $have[$r['TABLE_NAME'] . '.' . $r['INDEX_NAME']] = true;
+
+        foreach ($wanted as $table => $indexes) {
+            foreach ($indexes as $name => $cols) {
+                if (isset($have[$table . '.' . $name])) continue;
+                $pdo->exec("CREATE INDEX `$name` ON `$table` $cols");
+            }
+        }
+    } catch (Throwable $e) {
+        // An index is an optimisation, never a correctness requirement.
+    }
+}
+
 /** List contacts (from the aggregated view). */
 function list_contacts(array $filters): void
 {
+    ensure_list_indexes();
     $params = [];
     $where = build_where($filters, $params);
     $order = order_clause($filters);
@@ -140,11 +225,13 @@ function list_contacts(array $filters): void
     $stmt->execute($params);
     $rows = $stmt->fetchAll();
 
+    $followers = contact_followers_map(array_column($rows, 'id'));
+
     foreach ($rows as &$row) {
         $row['tags'] = $row['tags'] !== '' ? explode(',', $row['tags']) : [];
         $row['tag_ids'] = $row['tag_ids'] !== '' ? array_map('to_int', explode(',', $row['tag_ids'])) : [];
         $row['custom_fields'] = decode_custom_fields($row['custom_fields'] ?? null);
-        $row['followers'] = contact_followers((int)$row['id']);
+        $row['followers'] = $followers[(int)$row['id']] ?? [];
     }
 
     respond(['data' => $rows, 'count' => count($rows)]);
@@ -606,6 +693,7 @@ function list_workflows(array $filters): void
 /** LEADS ONLY — quick way to find leads. */
 function list_leads(array $filters): void
 {
+    ensure_list_indexes();
     $params = [];
     $clauses = [];
 
