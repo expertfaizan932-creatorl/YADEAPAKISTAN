@@ -293,7 +293,7 @@ function App() {
   }, [viewMode]);
 
   const load = useCallback(
-    async (mode: ViewMode, search: string) => {
+    async (mode: ViewMode, search: string): Promise<Contact[]> => {
       // Signed out (login screen): there is no bearer token yet, so every
       // request here is guaranteed to come back 401 "session expired" and pop
       // a confusing toast over the login form. Nothing to list until a user
@@ -301,7 +301,7 @@ function App() {
       if (!user) {
         setContacts([]);
         setLoading(false);
-        return;
+        return [];
       }
       setLoading(true);
       try {
@@ -311,10 +311,13 @@ function App() {
         if (user && user.user_type !== 'Admin') params.restrict_to = user.id;
         const isLeads = mode === 'Leads';
         const res = isLeads ? await api.listLeads(params) : await api.listContacts(params);
-        setContacts(res.data.map(mapApiContact));
+        const rows = res.data.map(mapApiContact);
+        setContacts(rows);
         setSelectedIds(new Set());
+        return rows;
       } catch (err) {
         showToast(`Failed to load: ${(err as Error).message}`);
+        return [];
       } finally {
         setLoading(false);
       }
@@ -525,6 +528,23 @@ function App() {
   };
 
   const reload = () => load(viewMode, searchQuery);
+
+  /**
+   * Keep a freshly created contact on screen.
+   *
+   * The server only returns what the caller may see, and the current tab may
+   * still hide the new row: a smart-list tab filters by member ids the new
+   * contact is not in yet, the Leads tab hides non-leads, and an active search
+   * may simply not match it. From the user's point of view that is "my contact
+   * was never saved" - so when none of the new ids came back, drop back to the
+   * All tab and clear the search to show the row right away.
+   */
+  const revealCreated = (createdIds: number[], rows: Contact[]) => {
+    if (createdIds.length === 0) return;
+    if (createdIds.some((id) => rows.some((r) => r.id === id))) return;
+    if (viewMode !== 'All') setViewMode('All');
+    if (searchQuery.trim()) setSearchQuery('');
+  };
 
   // Persist custom smart lists across reloads (scoped per user so one user's
   // lists never leak to another user logging in on the same browser).
@@ -995,7 +1015,7 @@ const handleAddSmartList = async (list: Omit<SmartList, 'id' | 'members'>) => {
   const handleAddContact = async (data: NewContactData) => {
     const { first, last } = splitName(data.name);
     try {
-      await api.createContact({
+      const res = await api.createContact({
         first_name: first,
         last_name: last,
         phone: data.phone,
@@ -1005,7 +1025,8 @@ const handleAddSmartList = async (list: Omit<SmartList, 'id' | 'members'>) => {
         avatar_data: data.image ?? null,
         tags: [data.tag.toLowerCase()],
       });
-      await reload();
+      const rows = await reload();
+      revealCreated([res.data.id], rows);
       showToast(`Contact "${data.name}" added successfully`);
       logActivity({ type: 'contact', title: 'Contact added', detail: data.name });
     } catch (err) {
@@ -1156,7 +1177,8 @@ const handleAddSmartList = async (list: Omit<SmartList, 'id' | 'members'>) => {
       }
     }
 
-    await reload();
+    const rows = await reload();
+    revealCreated(created.map((c) => c.id), rows);
     await refreshServerLists();
     showToast(
       `Imported ${importedCount} lead${importedCount === 1 ? '' : 's'}` +
