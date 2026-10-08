@@ -359,10 +359,14 @@ function create_public_lead(array $body): void
     }
     $body['tags'] = $tags;
 
-    create_contact($body);
+    // Website leads stay in the unassigned pool even when a staff member
+    // happens to be signed in on the browser that fills the form: the token
+    // rides along on every request, and create_contact() would otherwise hand
+    // the lead to whoever was logged in.
+    create_contact($body, true);
 }
 
-function create_contact(array $body): void
+function create_contact(array $body, bool $publicLead = false): void
 {
     $firstName = normalize_optional($body['first_name'] ?? null);
     $lastName = normalize_optional($body['last_name'] ?? null);
@@ -525,10 +529,34 @@ function create_contact(array $body): void
             respond(['data' => ['id' => $existingId], 'message' => 'Contact already exists; updated'], 200);
         }
 
+        // OWNER OF THE NEW ROW
+        //
+        // The tenancy rule (contact_scope_clause) only ever shows a non-admin
+        // their own rows, so a row inserted with assigned_to = NULL was visible
+        // to Admins alone: a Dealer who added a contact never saw it again.
+        // A signed-in non-admin therefore always owns what they create (and
+        // cannot create into somebody else's book), an Admin may name an owner
+        // explicitly, and the anonymous website form stays unassigned.
+        $assignedTo = null;
+        $creator = $publicLead ? null : api_current_user();
+        if ($creator !== null) {
+            if (($creator['user_type'] ?? '') === 'Admin') {
+                $reqOwner = $body['assigned_to'] ?? null;
+                $reqOwner = ($reqOwner === null || $reqOwner === '') ? 0 : to_int((string)$reqOwner);
+                if ($reqOwner > 0) {
+                    $ownerCheck = $pdo->prepare('SELECT id FROM staff_users WHERE id = :id');
+                    $ownerCheck->execute([':id' => $reqOwner]);
+                    if ($ownerCheck->fetch()) $assignedTo = $reqOwner;
+                }
+            } else {
+                $assignedTo = (int)$creator['id'];
+            }
+        }
+
         $stmt = $pdo->prepare(
             'INSERT INTO contacts (first_name, last_name, phone, email, business_name,
-                                   contact_type, is_lead, avatar_color, avatar_data, custom_fields)
-             VALUES (:fn, :ln, :phone, :email, :biz, :type, :lead, :color, :avatar, :custom)'
+                                   contact_type, is_lead, avatar_color, avatar_data, custom_fields, assigned_to)
+             VALUES (:fn, :ln, :phone, :email, :biz, :type, :lead, :color, :avatar, :custom, :assigned_to)'
         );
         $stmt->execute([
             ':fn' => $firstName,
@@ -541,6 +569,7 @@ function create_contact(array $body): void
             ':color' => $avatarColor,
             ':avatar' => $avatarData,
             ':custom' => $customFields,
+            ':assigned_to' => $assignedTo,
         ]);
 
         $contactId = (int)$pdo->lastInsertId();
@@ -3002,7 +3031,7 @@ function smart_list_payload(array $row): array
     ];
 }
 
-/** Visibility: a list is visible when owned, shared explicitly, or shared with everyone. */
+/** Visibility: a list is visible when owned, assigned to the caller, shared explicitly, or shared with everyone. */
 function smart_lists_visible(int $userId): PDOStatement
 {
     return db()->prepare(
@@ -3011,6 +3040,7 @@ function smart_lists_visible(int $userId): PDOStatement
            LEFT JOIN staff_users s ON s.id = sl.created_by
            LEFT JOIN staff_users d ON d.id = sl.dealer_id
           WHERE sl.created_by = :me
+             OR sl.dealer_id = :assigned
              OR sl.shared_all = 1
              OR sl.id IN (SELECT smart_list_id FROM smart_list_shares WHERE user_id = :me2)
           ORDER BY sl.created_at DESC, sl.id DESC'
@@ -3022,7 +3052,7 @@ function list_smart_lists(array $filters): void
 {
     $userId = smart_list_user($filters);
     $stmt = smart_lists_visible($userId);
-    $stmt->execute([':me' => $userId, ':me2' => $userId]);
+    $stmt->execute([':me' => $userId, ':me2' => $userId, ':assigned' => $userId]);
     $rows = $stmt->fetchAll();
 
     $rows = filter_smart_lists_for_staff($rows, $userId);
@@ -3044,19 +3074,27 @@ function staff_accessible_contact_ids(int $userId): array
 
 /**
  * Dealers and followers start with a clean slate: until leads are assigned to
- * them they see no smart lists at all. Afterwards a shared list appears only
- * when it is assigned to them (dealer_id), shared explicitly with them, or
- * contains at least one of their own contacts. Admins are unaffected.
+ * them they see no smart lists at all. Afterwards a list appears only when the
+ * Admin assigned it to them (dealer_id), shared it with them by name
+ * (smart_list_shares), or they created it themselves. Admins are unaffected.
+ *
+ * Two older rules used to flood every dealer's tab strip with the whole list
+ * library: `shared_all = 1` (a global list) and "the list contains one of my
+ * contacts" - the second one fired the moment an Admin assigned leads out of a
+ * list, which is exactly the moment a dealer should NOT inherit it. Both are
+ * deliberately gone for non-admins.
  */
 function filter_smart_lists_for_staff(array $rows, int $userId): array
 {
     if (!$rows) return $rows;
-    $u = db()->prepare('SELECT user_type FROM staff_users WHERE id = :id');
-    $u->execute([':id' => $userId]);
-    $type = (string)($u->fetchColumn() ?: '');
-    if ($type === '' || $type === 'Admin') return $rows;
 
-    $mineSet = array_fill_keys(staff_accessible_contact_ids($userId), true);
+    // Only a real Admin bypasses the filter. An empty/unknown user_type used to
+    // be treated as Admin here ("$type === ''"), so a dealer whose type came
+    // back blank sailed straight through and saw the whole library. Unknown
+    // types now fall through to the restrictive branch: they keep only what was
+    // assigned to them, shared with them, or created by them.
+    if (is_api_admin()) return $rows;
+
     $shared = db()->prepare('SELECT smart_list_id FROM smart_list_shares WHERE user_id = :u');
     $shared->execute([':u' => $userId]);
     $sharedSet = array_fill_keys(array_map('intval', $shared->fetchAll(PDO::FETCH_COLUMN)), true);
@@ -3067,13 +3105,6 @@ function filter_smart_lists_for_staff(array $rows, int $userId): array
             || (int)($row['dealer_id'] ?? 0) === $userId
             || isset($sharedSet[(int)$row['id']])) {
             $out[] = $row;
-            continue;
-        }
-        foreach (decode_json_field($row['members'] ?? null) as $m) {
-            if (is_numeric($m) && isset($mineSet[(int)$m])) {
-                $out[] = $row;
-                break;
-            }
         }
     }
     return $out;
@@ -3251,7 +3282,7 @@ function duplicate_smart_list(int $id, array $body): void
 
     // Reuse the normal visibility rule for the source list.
     $visible = smart_lists_visible($userId);
-    $visible->execute([':me' => $userId, ':me2' => $userId]);
+    $visible->execute([':me' => $userId, ':me2' => $userId, ':assigned' => $userId]);
     $candidates = array_values(array_filter(
         $visible->fetchAll(),
         static fn($r) => (int)$r['id'] === $id

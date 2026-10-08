@@ -120,8 +120,12 @@ function App() {
     }
   });
   const [customLists, setCustomLists] = useState<SmartList[]>(() => {
+    // Scoped to the signed-in user: the shared legacy key is what let one
+    // account's lists show up for the next account that logged in on the same
+    // browser, so a Dealer could open the CRM to somebody else's list strip.
+    if (!user) return [];
     try {
-      const raw = localStorage.getItem(SMART_LIST_STORAGE_KEY);
+      const raw = localStorage.getItem(smartListStorageKey(user.id));
       if (raw) {
         const parsed = JSON.parse(raw) as SmartList[];
         if (Array.isArray(parsed)) return parsed;
