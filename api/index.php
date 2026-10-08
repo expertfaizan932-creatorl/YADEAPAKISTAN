@@ -366,6 +366,52 @@ function create_public_lead(array $body): void
     create_contact($body, true);
 }
 
+/**
+ * Drop the unique email/phone keys off contacts so a dealer can always save.
+ *
+ * The shipped schema marks contacts.email and contacts.phone UNIQUE, but the
+ * tenancy rule deliberately files a FRESH row when the caller cannot see the
+ * one already carrying that value - a dealer must never merge into (overwrite,
+ * or be blocked by) somebody else's record, and the anonymous website form
+ * always files a new lead. With the keys in place that INSERT died with
+ * `SQLSTATE[23000] ... Duplicate entry 'x' for key 'uq_contact_email'` and the
+ * contact was never saved; the same hit update_contact() when an email was
+ * edited onto a value another tenant already owned.
+ *
+ * Application-level dedupe is the real protection (see create_contact(), which
+ * only ever merges into a row the caller may see), so the two indexes go.
+ * Idempotent: information_schema says which ones still exist and only those
+ * are dropped, once per request; any failure is swallowed - it must never turn
+ * a working save into a broken request.
+ */
+function ensure_contacts_may_duplicate(): void
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+
+    try {
+        $pdo = db();
+        // Every UNIQUE index (whatever it is called) on email or phone: the
+        // names differ between schema versions, the intent does not.
+        $stmt = $pdo->prepare(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'contacts'
+                AND NON_UNIQUE = 0
+                AND INDEX_NAME <> 'PRIMARY'
+                AND COLUMN_NAME IN ('email', 'phone')"
+        );
+        $stmt->execute();
+        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $indexName) {
+            // $indexName comes from information_schema, never from a request.
+            $pdo->exec('DROP INDEX `' . $indexName . '` ON `contacts`');
+        }
+    } catch (Throwable $e) {
+        // Never fatal - see the doc block above.
+    }
+}
+
 function create_contact(array $body, bool $publicLead = false): void
 {
     $firstName = normalize_optional($body['first_name'] ?? null);
@@ -426,34 +472,53 @@ function create_contact(array $body, bool $publicLead = false): void
         || in_array('hot lead', $tagInput, true)
         || in_array('cold lead', $tagInput, true);
 
+    // DDL before the transaction: MySQL would implicitly commit it.
+    ensure_contacts_may_duplicate();
+
     $pdo = db();
     $pdo->beginTransaction();
     try {
-        // Dedupe on email OR phone: if an existing contact already carries
-        // either value, update it instead of failing, so form re-submissions
-        // never hard-block with a "duplicate" error.
+        // Dedupe on email OR phone - but only against a row the caller may see
+        // (an Admin sees everything, a Dealer only their own, an anonymous
+        // website form nothing). Tenancy comes from the session token, never
+        // from the request.
+        //
+        // Two things go wrong without the scope: a dealer would merge into - and
+        // so overwrite - a colleague's record, and when they cannot see the
+        // match the INSERT used to die on the old unique email/phone keys with
+        // `Duplicate entry ... for key 'uq_contact_email'`. An inaccessible
+        // match now simply means "file a fresh row I own".
         $existingId = 0;
         if ($email !== null || $phone !== null) {
-            $dupSql = 'SELECT id FROM contacts WHERE 1=0';
+            // Resolve the caller WITHOUT require_api_user(): the public website
+            // form reaches here anonymous, and a 401 there would kill a lead.
+            // Zero scopes the lookup to "match nothing" (see below).
+            $dupUser = api_current_user();
+            $dupUserId = $dupUser !== null ? (int)($dupUser['id'] ?? 0) : 0;
+
+            $dupSql = 'SELECT c.id FROM contacts c WHERE (1=0';
             $dupParams = [];
             if ($email !== null) {
-                $dupSql .= ' OR email = :dup_email';
+                $dupSql .= ' OR c.email = :dup_email';
                 $dupParams[':dup_email'] = $email;
             }
             if ($phone !== null) {
-                $dupSql .= ' OR phone = :dup_phone';
+                $dupSql .= ' OR c.phone = :dup_phone';
                 $dupParams[':dup_phone'] = $phone;
             }
+            // Live rows win over soft-deleted ones; one row is all we need.
+            $dupSql .= ') AND ' . contact_scope_clause('c', $dupUserId, $dupParams, 'dupscope')
+                . ' ORDER BY (c.deleted_at IS NULL) DESC, c.id DESC LIMIT 1';
             $dupStmt = $pdo->prepare($dupSql);
             $dupStmt->execute($dupParams);
             $dupId = $dupStmt->fetchColumn();
             if ($dupId !== false) $existingId = (int)$dupId;
         }
 
-        // Only merge into a contact the caller can actually see. Without this a
-        // dealer (or a public website form) could submit somebody else's email
-        // and overwrite — and un-soft-delete — that person's record, because the
-        // dedupe lookup ran across every tenant.
+        // Belt and braces: the lookup above was already scoped, so this only
+        // re-confirms. Kept because merging into a row the caller cannot see
+        // would overwrite - and un-soft-delete - somebody else's record, which
+        // is exactly the failure this guard was added for.
         if ($existingId > 0 && !caller_can_access_contact($existingId)) {
             $existingId = 0;
         }
@@ -1260,6 +1325,10 @@ function delete_staff(int $id): void
 function update_contact(int $id, array $body): void
 {
     ensure_contact_exists($id);
+
+    // Editing an email/phone onto a value another tenant already owns must not
+    // die on the old unique keys (see ensure_contacts_may_duplicate()).
+    ensure_contacts_may_duplicate();
 
     // Verify assigned staff exists when provided.
     $assignedTo = null;

@@ -41,8 +41,14 @@ CREATE TABLE contacts (
   PRIMARY KEY (id),
 
   -- Exact lookups: dedupe + "did we already import this phone/email?"
-  UNIQUE KEY uq_contact_phone (phone),
-  UNIQUE KEY uq_contact_email (email),
+  -- Deliberately NOT unique: tenancy gives every Dealer their own row, so a
+  -- value another tenant already owns must never block a save (it used to fail
+  -- with "Duplicate entry ... for key 'uq_contact_email'"). The application-
+  -- level dedupe in api/index.php create_contact() - which only ever merges
+  -- into a row the caller may see - is the real protection, and
+  -- ensure_contacts_may_duplicate() drops these keys from older databases.
+  KEY idx_contact_phone (phone),
+  KEY idx_contact_email (email),
 
   -- Range / filter lookups
   KEY idx_contact_name  (last_name, first_name),

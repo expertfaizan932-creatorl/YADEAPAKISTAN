@@ -282,8 +282,8 @@ ALTER TABLE `appointments`
 --
 ALTER TABLE `contacts`
   ADD PRIMARY KEY (`id`),
-  ADD UNIQUE KEY `uq_contact_phone` (`phone`),
-  ADD UNIQUE KEY `uq_contact_email` (`email`),
+  ADD KEY `idx_contact_phone` (`phone`),
+  ADD KEY `idx_contact_email` (`email`),
   ADD KEY `idx_contact_name` (`last_name`,`first_name`),
   ADD KEY `idx_contact_type` (`contact_type`),
   ADD KEY `idx_contact_lead` (`is_lead`),
