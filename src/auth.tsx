@@ -70,6 +70,33 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+/**
+ * Push the *current* session into the API client synchronously.
+ *
+ * The client keeps its bearer token in a module variable, so a session that is
+ * only handed over inside a useEffect arrives too late: AuthProvider is the
+ * parent, and React runs a child's effects first - App's first data load would
+ * already be on the wire before the token is set, and come back 401. Calling
+ * this at the exact moment the session changes (and once here at module load,
+ * for a session restored from localStorage) removes that race entirely.
+ */
+function syncApiSession(next: StoredSession | null, actingId: number | null): void {
+  setAuthToken(next?.token ?? null);
+  setActingAsStaffId(next ? actingId : null);
+}
+
+/** Restored-from-localStorage session, applied before the very first render. */
+const RESTORED_SESSION: StoredSession | null = readStored(SESSION_KEY);
+const RESTORED_ORIGINAL: ApiStaffUser | null = RESTORED_SESSION
+  ? readStored(IMPERSONATION_KEY)?.user ?? null
+  : null;
+if (RESTORED_SESSION) {
+  syncApiSession(
+    RESTORED_SESSION,
+    RESTORED_ORIGINAL ? RESTORED_SESSION.user.id : null
+  );
+}
+
 function readStored(key: string): StoredSession | null {
   try {
     const raw = localStorage.getItem(key);
@@ -163,6 +190,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const res = await api.login(input);
       if (!res.token) throw new Error('Login did not return a session token.');
       setOriginalUser(null);
+      // Token first, synchronously: App's first load runs in this same commit
+      // (child effects fire before this provider's), so waiting for an effect
+      // would send that request with no Authorization header.
+      syncApiSession({ user: res.data, token: res.token }, null);
       setSession({ user: res.data, token: res.token });
       return res.data;
     } finally {
@@ -173,6 +204,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const completeLogin = useCallback((u: ApiStaffUser, t: string) => {
     if (!t) throw new Error('Login did not return a session token.');
     setOriginalUser(null);
+    syncApiSession({ user: u, token: t }, null);
     setSession({ user: u, token: t });
   }, []);
 
@@ -180,6 +212,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Revoke on the server, but never let a failing request trap the user in a
     // session they have already chosen to leave.
     void api.logout().catch(() => undefined);
+    syncApiSession(null, null);
     setSession(null);
     setOriginalUser(null);
   }, []);
@@ -190,9 +223,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (!token) throw new Error('Session expired. Please sign in again.');
       const res = await api.getStaff(staffId);
       if (!res.data) throw new Error('Staff user not found');
-      // Keep the Admin's token: the X-Acting-As header set by the effect above
+      // Keep the Admin's token: the X-Acting-As header set here
       // is what switches the scope, so the Admin can still come back.
       setOriginalUser(user);
+      syncApiSession({ user: res.data, token }, res.data.id);
       setSession({ user: res.data, token });
       return res.data;
     },
@@ -201,6 +235,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const switchBack = useCallback(() => {
     if (!originalUser || !token) return;
+    syncApiSession({ user: originalUser, token }, null);
     setSession({ user: originalUser, token });
     setOriginalUser(null);
   }, [originalUser, token]);

@@ -290,7 +290,16 @@ function App() {
 
   const load = useCallback(
     async (mode: ViewMode, search: string) => {
-setLoading(true);
+      // Signed out (login screen): there is no bearer token yet, so every
+      // request here is guaranteed to come back 401 "session expired" and pop
+      // a confusing toast over the login form. Nothing to list until a user
+      // is signed in.
+      if (!user) {
+        setContacts([]);
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
       try {
         const params: ListParams = search.trim() ? { search: search.trim() } : {};
         // Dealers & Followers only ever see the leads assigned to / followed by

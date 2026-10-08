@@ -10,6 +10,11 @@ export default defineConfig({
         target: 'http://localhost',
         changeOrigin: true,
       },
+      // Local dev: PHP built-in server (php -S 127.0.0.1:8080 -t <root>)
+      '/api': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+      },
     },
   },
   build: {
