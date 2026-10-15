@@ -3187,15 +3187,42 @@ function filter_smart_lists_for_staff(array $rows, int $userId): array
 }
 
 /**
- * The names of the auto-created outlet smart lists, read from the saved forms
- * (a name is an outlet list when it is one of a form's outlet dropdown options).
- * Cached for the request; an unreadable forms table just yields an empty set.
+ * Names of the auto-created outlet lists, which a non-Admin must never inherit
+ * just by owning the row. Built from two sources so it cannot miss a leak:
+ *
+ *  1. the Admin's own auto-created library (name + no filters/fields/sort) -
+ *     this is the definitive outlet set even for outlets later removed from a
+ *     form, and  2. the outlets currently configured on the saved forms, so an
+ *     outlet added but not yet saved under the Admin still counts.
+ *
+ * Cached for the request; an unreadable source just contributes nothing.
  */
 function smart_list_outlet_names(): array
 {
     static $names = null;
     if ($names !== null) return $names;
     $names = [];
+
+    // 1. the Admin library
+    try {
+        $owner = outlet_smart_list_owner();
+        if ($owner > 0) {
+            $stmt = db()->prepare(
+                'SELECT name FROM smart_lists
+                  WHERE created_by = :owner
+                    AND filters IS NULL AND sort_by IS NULL
+                    AND fields IS NULL AND dealer_id IS NULL'
+            );
+            $stmt->execute([':owner' => $owner]);
+            foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $n) {
+                if ((string)$n !== '') $names[(string)$n] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        // keep whatever we have so far
+    }
+
+    // 2. the outlets on the saved forms
     try {
         ensure_forms_table();
         foreach (db()->query('SELECT elements FROM forms')->fetchAll(PDO::FETCH_COLUMN) as $raw) {
@@ -3204,8 +3231,9 @@ function smart_list_outlet_names(): array
             }
         }
     } catch (Throwable $e) {
-        $names = [];
+        // keep whatever we have so far
     }
+
     return $names;
 }
 
