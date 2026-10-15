@@ -3142,16 +3142,20 @@ function staff_accessible_contact_ids(int $userId): array
 }
 
 /**
- * Dealers and followers start with a clean slate: until leads are assigned to
- * them they see no smart lists at all. Afterwards a list appears only when the
- * Admin assigned it to them (dealer_id), shared it with them by name
- * (smart_list_shares), or they created it themselves. Admins are unaffected.
+ * Non-Admins only ever see lists the Admin deliberately handed to them:
+ * assigned to them as a Dealer (dealer_id) or shared with them by name
+ * (smart_list_shares). They also keep the lists they created themselves, with
+ * one deliberate exception: the auto-created outlet lists.
  *
- * Two older rules used to flood every dealer's tab strip with the whole list
- * library: `shared_all = 1` (a global list) and "the list contains one of my
- * contacts" - the second one fired the moment an Admin assigned leads out of a
- * list, which is exactly the moment a dealer should NOT inherit it. Both are
- * deliberately gone for non-admins.
+ * The auto-created outlet lists are what flooded every dealer's tab strip. They
+ * belong to the Admin's library, but ownership drifted: the lists are stamped
+ * with "the first Admin account", and as accounts were added and re-typed that
+ * "first Admin" changed - so accounts that later became Dealers ended up owning
+ * a whole 95-outlet set and saw every one of them. A non-Admin therefore never
+ * gets an outlet list just by owning it; the Admin must assign or share it.
+ *
+ * `shared_all = 1` (a global list) and the old "contains one of my contacts"
+ * rule are also intentionally not enough for a non-Admin. Admins are unaffected.
  */
 function filter_smart_lists_for_staff(array $rows, int $userId): array
 {
@@ -3159,24 +3163,50 @@ function filter_smart_lists_for_staff(array $rows, int $userId): array
 
     // Only a real Admin bypasses the filter. An empty/unknown user_type used to
     // be treated as Admin here ("$type === ''"), so a dealer whose type came
-    // back blank sailed straight through and saw the whole library. Unknown
-    // types now fall through to the restrictive branch: they keep only what was
-    // assigned to them, shared with them, or created by them.
+    // back blank sailed straight through and saw the whole library.
     if (is_api_admin()) return $rows;
 
     $shared = db()->prepare('SELECT smart_list_id FROM smart_list_shares WHERE user_id = :u');
     $shared->execute([':u' => $userId]);
     $sharedSet = array_fill_keys(array_map('intval', $shared->fetchAll(PDO::FETCH_COLUMN)), true);
 
+    $outletNames = smart_list_outlet_names();
+
     $out = [];
     foreach ($rows as $row) {
-        if ((int)$row['created_by'] === $userId
-            || (int)($row['dealer_id'] ?? 0) === $userId
+        if ((int)($row['dealer_id'] ?? 0) === $userId
             || isset($sharedSet[(int)$row['id']])) {
+            $out[] = $row;
+            continue;
+        }
+        if ((int)$row['created_by'] === $userId && !isset($outletNames[(string)$row['name']])) {
             $out[] = $row;
         }
     }
     return $out;
+}
+
+/**
+ * The names of the auto-created outlet smart lists, read from the saved forms
+ * (a name is an outlet list when it is one of a form's outlet dropdown options).
+ * Cached for the request; an unreadable forms table just yields an empty set.
+ */
+function smart_list_outlet_names(): array
+{
+    static $names = null;
+    if ($names !== null) return $names;
+    $names = [];
+    try {
+        ensure_forms_table();
+        foreach (db()->query('SELECT elements FROM forms')->fetchAll(PDO::FETCH_COLUMN) as $raw) {
+            foreach (extract_form_outlets(decode_json_field($raw === null ? null : (string)$raw)) as $n) {
+                $names[(string)$n] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        $names = [];
+    }
+    return $names;
 }
 
 /** Validate and normalize the JSON-column inputs of a smart list. */
@@ -3429,9 +3459,16 @@ function extract_form_outlets($elements): array
 }
 
 /**
- * Make sure one global smart list exists for every outlet configured on a form.
+ * Make sure one smart list exists for every outlet configured on a form.
  * Called whenever a form is created/updated, so a newly added outlet instantly
  * gets its own smart list (outlet <-> smart list stay connected).
+ *
+ * Existence is keyed on the name alone, not the owner. The old INSERT IGNORE
+ * relied on a unique index that does not exist, so every time the "first Admin"
+ * changed the same 95 outlets were inserted again - piling up duplicate outlet
+ * lists (and handing a set to whichever account later became that "first
+ * Admin"). These lists belong to the Admin library and stay out of a dealer's
+ * view unless the Admin assigns or shares them.
  */
 function ensure_outlet_smart_lists(array $outlets): void
 {
@@ -3443,12 +3480,15 @@ function ensure_outlet_smart_lists(array $outlets): void
     $owner = outlet_smart_list_owner();
     if ($owner <= 0) return;
     try {
+        $exists = db()->prepare('SELECT 1 FROM smart_lists WHERE name = :name LIMIT 1');
         $ins = db()->prepare(
-            'INSERT IGNORE INTO smart_lists
+            'INSERT INTO smart_lists
                 (name, filters, sort_by, fields, members, dealer_id, shared_all, created_by)
-             VALUES (:name, NULL, NULL, NULL, NULL, NULL, 1, :owner)'
+             VALUES (:name, NULL, NULL, NULL, NULL, NULL, 0, :owner)'
         );
         foreach ($outlets as $name) {
+            $exists->execute([':name' => $name]);
+            if ($exists->fetchColumn() !== false) continue;
             $ins->execute([':name' => $name, ':owner' => $owner]);
         }
     } catch (Throwable $e) {
