@@ -610,8 +610,11 @@ export default function InvoicesPage({ onNotify }: InvoicesPageProps) {
   const setOverride = (key: 'totalExcl' | 'taxPayable' | 'totalIncl', raw: string) =>
     setContent((c) => ({ ...c, [key]: raw.trim() === '' ? '' : raw.trim() }));
 
-  /** Edited copy for a sheet text node, falling back to the shipped wording. */
-  const txt = (key: string) => content.text?.[key] ?? DEFAULT_TEXT[key] ?? '';
+  /** Edited copy for a sheet text node, falling back to the shipped wording.
+   *  An empty override means "use the default" (setTxt stores '' when a node is
+   *  left on its default), so a blank string must fall back too — using ?? here
+   *  wiped the copy the moment an untouched field was focused and blurred. */
+  const txt = (key: string) => content.text?.[key] || DEFAULT_TEXT[key] || '';
 
   const setTxt = (key: string, value: string) =>
     setContent((c) => ({
