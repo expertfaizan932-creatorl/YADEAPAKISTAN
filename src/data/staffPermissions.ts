@@ -306,6 +306,29 @@ export const PERMISSION_CATEGORIES: PermissionCategory[] = [
     features: fromItems(['View & manage quizzes']),
   },
   {
+    id: 'dealership',
+    label: 'Dealership',
+    icon: 'store',
+    features: [
+      { label: 'Dealership Applications', actions: ['view', 'add', 'delete', 'export'] },
+      { label: 'Assign/Unassign', actions: ['assign', 'unassign'] },
+      { label: 'Public Form Link', actions: ['view', 'send'] },
+      { label: 'Confirmation Emails', actions: ['send'] },
+    ],
+  },
+  {
+    id: 'inquiries',
+    label: 'Customer Inquiries',
+    icon: 'headset',
+    features: [
+      { label: 'Customer Inquiries', actions: ['view', 'add', 'delete', 'export'] },
+      { label: 'Assign/Unassign', actions: ['assign', 'unassign'] },
+      { label: 'Public Form Link', actions: ['view', 'send'] },
+      { label: 'Confirmation Emails', actions: ['send'] },
+      { label: 'Assignment Notifications', actions: ['send'] },
+    ],
+  },
+  {
     id: 'dashboard',
     label: 'Dashboard',
     icon: 'table-columns',

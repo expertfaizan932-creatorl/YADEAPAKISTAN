@@ -1720,6 +1720,20 @@ function current_user_id(): int
     return (int)$user['id'];
 }
 
+/**
+ * True when the caller holds a granular permission key such as
+ * `dealership:Assign/Unassign:assign`. Admins hold every key; everyone else
+ * gets exactly what their staff row's permissions JSON says.
+ */
+function api_user_can(string $catId, string $label, string $action): bool
+{
+    $user = api_current_user();
+    if ($user === null) return false;
+    if (($user['user_type'] ?? '') === 'Admin') return true;
+    $perms = decode_json_field($user['permissions'] ?? null);
+    return !empty($perms[$catId . ':' . $label . ':' . $action]);
+}
+
 function is_api_admin(): bool
 {
     $user = api_current_user();
@@ -4383,11 +4397,20 @@ function list_submissions(array $filters): void
 /** POST /submissions/{id}/assign { assigned_to } -> assign/unassign a dealer. */
 function assign_submission(int $id, array $body): void
 {
-    // Handing an inquiry to a dealer decides whose book it lands in, so only an
-    // Admin may do it.
-    require_api_admin();
+    require_api_user();
     ensure_portal_submissions_table();
     $dealerId = to_int((string)($body['assigned_to'] ?? 0));
+
+    // Handing a record to a dealer decides whose book it lands in, so it needs
+    // the Assign/Unassign permission for that module (Admins always have it).
+    $getType = db()->prepare('SELECT type FROM portal_submissions WHERE id = :id');
+    $getType->execute([':id' => $id]);
+    $type = (string)($getType->fetchColumn() ?: '');
+    if ($type === '') fail('Submission not found', 404);
+    $cat = $type === 'inquiry' ? 'inquiries' : 'dealership';
+    if (!api_user_can($cat, 'Assign/Unassign', 'assign')) {
+        fail('You do not have permission to assign this record.', 403);
+    }
 
     if ($dealerId > 0) {
         $chk = db()->prepare("SELECT id FROM staff_users WHERE id = :id AND user_type IN ('Admin','Dealer') LIMIT 1");
@@ -4443,12 +4466,21 @@ function assign_submission(int $id, array $body): void
 /** DELETE /submissions/{id} */
 function delete_submission(int $id): void
 {
+    require_api_user();
     ensure_portal_submissions_table();
-    // A non-Admin may only discard an inquiry sitting in their own book.
+    // A non-Admin needs the module's Delete permission and may only discard a
+    // record sitting in their own book.
     if (!is_api_admin()) {
-        $own = db()->prepare('SELECT 1 FROM portal_submissions WHERE id = :id AND assigned_to = :me LIMIT 1');
-        $own->execute([':id' => $id, ':me' => current_user_id()]);
-        if (!$own->fetchColumn()) fail('Submission not found', 404);
+        $own = db()->prepare('SELECT type, assigned_to FROM portal_submissions WHERE id = :id LIMIT 1');
+        $own->execute([':id' => $id]);
+        $row = $own->fetch();
+        if (!$row) fail('Submission not found', 404);
+        $cat = ($row['type'] ?? '') === 'inquiry' ? 'inquiries' : 'dealership';
+        $label = $cat === 'inquiries' ? 'Customer Inquiries' : 'Dealership Applications';
+        if (!api_user_can($cat, $label, 'delete')) {
+            fail('You do not have permission to delete this record.', 403);
+        }
+        if ((int)($row['assigned_to'] ?? 0) !== current_user_id()) fail('Submission not found', 404);
     }
     db()->prepare('DELETE FROM portal_submissions WHERE id = :id')->execute([':id' => $id]);
     respond(['message' => 'Submission deleted']);

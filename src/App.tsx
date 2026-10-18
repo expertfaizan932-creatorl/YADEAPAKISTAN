@@ -1256,9 +1256,9 @@ const handleAddSmartList = async (list: Omit<SmartList, 'id' | 'members'>) => {
       : route.name === 'invoices'
       ? 'invoices'
       : route.name === 'dealership-portal'
-      ? 'dashboard'
+      ? 'dealership'
       : route.name === 'inquiries-portal'
-      ? 'dashboard'
+      ? 'inquiries'
       : 'contacts';
   if (route.name !== 'dashboard' && !hasPermission(routePerm)) {
     return (

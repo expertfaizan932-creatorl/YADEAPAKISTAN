@@ -68,8 +68,17 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 function CustomerInquiriesPage({ onNotify }: PageProps) {
-  const { user } = useAuth();
+  const { user, hasActionPermission } = useAuth();
   const isAdmin = user?.user_type === 'Admin';
+  const canView = hasActionPermission('inquiries', 'Customer Inquiries', 'view');
+  const canAdd = hasActionPermission('inquiries', 'Customer Inquiries', 'add');
+  const canDelete = hasActionPermission('inquiries', 'Customer Inquiries', 'delete');
+  const canExport = hasActionPermission('inquiries', 'Customer Inquiries', 'export');
+  const canAssign = hasActionPermission('inquiries', 'Assign/Unassign', 'assign');
+  const canUnassign = hasActionPermission('inquiries', 'Assign/Unassign', 'unassign');
+  const canCopyLink = hasActionPermission('inquiries', 'Public Form Link', 'send');
+  const canConfirmEmail = hasActionPermission('inquiries', 'Confirmation Emails', 'send');
+  const canNotifyDealer = hasActionPermission('inquiries', 'Assignment Notifications', 'send');
 
   const [form, setForm] = useState({
     chassisNumber: '',
@@ -119,14 +128,15 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
   }, [load]);
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!canAssign) return;
     api
       .listStaff()
       .then((res) => setDealers(res.data.filter((s) => s.user_type === 'Dealer')))
       .catch(() => undefined);
-  }, [isAdmin]);
+  }, [canAssign]);
 
   const submit = async () => {
+    if (!canAdd) return onNotify('You do not have permission to add customer inquiries');
     if (!form.chassisNumber.trim()) return onNotify('Chassis number is required');
     if (!form.problemCategory) return onNotify('Please pick your problem');
     if (!form.custName.trim()) return onNotify('Name is required');
@@ -152,10 +162,11 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
 
       // Send confirmation email to submitter
       const refCode = res.data?.code || '';
-      sendSmtpEmail({
-        to: [form.custEmail.trim()],
-        subject: `Support Ticket ${refCode} Received — Yadea Pakistan`,
-        html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+      if (canConfirmEmail) {
+        sendSmtpEmail({
+          to: [form.custEmail.trim()],
+          subject: `Support Ticket ${refCode} Received — Yadea Pakistan`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
           <h2 style="color:#12161a;">We've Received Your Support Ticket</h2>
           <p>Dear ${form.custName.trim()},</p>
           <p>Thank you for reaching out to Yadea Pakistan. Your support ticket has been successfully submitted.</p>
@@ -167,7 +178,8 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
           <p>Our team will review your ticket and respond within 48 business hours.</p>
           <p style="color:#64748b;font-size:12px;margin-top:24px;">Yadea Pakistan — Driving Sustainable Mobility Forward</p>
         </div>`,
-      }).catch(() => undefined);
+        }).catch(() => undefined);
+      }
       setForm({ chassisNumber: '', orderNumber: '', problemCategory: '', custName: '', custEmail: '', custPhone: '', custReason: '' });
       setConsent(false);
       await load();
@@ -179,6 +191,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
   };
 
   const assign = async (row: ApiPortalSubmission) => {
+    if (!canAssign) return onNotify('You do not have permission to assign inquiries');
     const dealerId = assignPick[row.id];
     if (!dealerId) return onNotify('Pick a dealer first');
     try {
@@ -188,7 +201,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
       onNotify(`Inquiry ${row.code} assigned to ${name} — dealer notified`);
 
       // Send assignment notification email to dealer
-      if (dealer?.email) {
+      if (dealer?.email && canNotifyDealer) {
         sendSmtpEmail({
           to: [dealer.email],
           subject: `New Inquiry Assigned to You — ${row.code}`,
@@ -219,6 +232,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
   };
 
   const unassign = async (row: ApiPortalSubmission) => {
+    if (!canUnassign) return onNotify('You do not have permission to unassign inquiries');
     try {
       await api.assignPortalSubmission(row.id, 0);
       onNotify(`Assignment removed from ${row.code}`);
@@ -229,6 +243,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
   };
 
   const removeRow = async (row: ApiPortalSubmission) => {
+    if (!canDelete) return onNotify('You do not have permission to delete customer inquiries');
     if (!window.confirm(`Delete inquiry ${row.code}?`)) return;
     try {
       await api.deletePortalSubmission(row.id);
@@ -246,6 +261,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
   };
 
   const exportCsv = () => {
+    if (!canExport) return onNotify('You do not have permission to export inquiries');
     if (rows.length === 0) return onNotify('Nothing to export yet');
     let csv = 'Code,Customer,Email,Phone,Chassis,Order,Problem,Status,Assigned To,Submitted\n';
     rows.forEach((r) => {
@@ -302,6 +318,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
 
       <div className="max-w-5xl mx-auto px-3 md:px-6 -mt-10 pb-10 relative z-10 space-y-6">
         {/* Ticket form */}
+        {canAdd && (
         <div className="bg-white rounded-2xl shadow-xl p-5 md:p-8 border border-slate-100">
           <h3 className="text-xl font-bold text-slate-900 uppercase tracking-wide text-center mb-6">
             Submit A Ticket
@@ -343,6 +360,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
             </div>
           </div>
         </div>
+        )}
 
         {/* Stats */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -364,6 +382,13 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
         </div>
 
         {/* Inquiries table */}
+        {!canView ? (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 text-center">
+          <p className="text-xs text-slate-500">
+            You don't have permission to view customer inquiries. Ask an administrator to enable it.
+          </p>
+        </div>
+        ) : (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
           <div className="p-4 border-b border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-1.5">
@@ -388,6 +413,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
                 placeholder="Search inquiries…"
                 className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-yadea-orange w-44"
               />
+              {canCopyLink && (
               <button
                 onClick={() => void copyFormLink()}
                 className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5"
@@ -395,9 +421,12 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
               >
                 <FaLink className="text-[10px]" /> Copy Form Link
               </button>
+              )}
+              {canExport && (
               <button onClick={exportCsv} className="text-xs bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5">
                 <FaDownload className="text-[10px]" /> Export CSV
               </button>
+              )}
             </div>
           </div>
 
@@ -447,7 +476,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
                             <div className="flex items-center gap-1 text-[11px] text-slate-600">
                               <FaUserCheck className="text-emerald-500 text-[9px]" />
                               <span className="truncate max-w-[90px]">{r.assigned_to_name ?? '-'}</span>
-                              {isAdmin && (
+                              {canUnassign && (
                                 <button onClick={() => void unassign(r)} title="Remove assignment" className="text-slate-300 hover:text-red-500 transition">
                                   <FaXmark className="text-[9px]" />
                                 </button>
@@ -462,7 +491,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
                       </td>
                       <td className="px-4 py-3 text-right whitespace-nowrap">
                         <div className="relative inline-block text-left space-x-1.5">
-                          {isAdmin && (
+                          {canAssign && (
                             <button
                               ref={(el) => {
                                 assignBtnRefs.current[r.id] = el;
@@ -482,14 +511,14 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
                           <button onClick={() => setViewing(r)} className="text-slate-600 hover:text-yadea-orange text-[11px] font-bold px-2 py-1 bg-slate-100 rounded hover:bg-orange-50 transition">
                             View
                           </button>
-                          {isAdmin && (
+                          {canDelete && (
                             <button onClick={() => void removeRow(r)} className="text-red-500 hover:text-red-700 text-[11px] px-2 py-1 bg-red-50 rounded hover:bg-red-100 transition">
                               <FaRegTrashCan />
                             </button>
                           )}
 
                           <AnchoredPopover
-                            open={isAdmin && openAssign === r.id}
+                            open={canAssign && openAssign === r.id}
                             anchorEl={assignBtnRefs.current[r.id] ?? null}
                             onClose={() => setOpenAssign(null)}
                             placement="bottom-end"
@@ -516,7 +545,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
                               >
                                 Assign & Notify
                               </button>
-                              {r.assigned_to && (
+                              {r.assigned_to && canUnassign && (
                                 <button
                                   onClick={() => void unassign(r)}
                                   className="flex-1 bg-slate-100 hover:bg-red-50 text-slate-600 hover:text-red-600 text-[11px] font-bold py-1.5 rounded-md transition"
@@ -535,6 +564,7 @@ function CustomerInquiriesPage({ onNotify }: PageProps) {
             </table>
           </div>
         </div>
+        )}
 
         {!isAdmin && (
           <p className="text-[11px] text-slate-400 text-center -mt-2">

@@ -52,8 +52,15 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 function DealershipApplicationsPage({ onNotify }: PageProps) {
-  const { user } = useAuth();
-  const isAdmin = user?.user_type === 'Admin';
+  const { user, hasActionPermission } = useAuth();
+  const canView = hasActionPermission('dealership', 'Dealership Applications', 'view');
+  const canAdd = hasActionPermission('dealership', 'Dealership Applications', 'add');
+  const canDelete = hasActionPermission('dealership', 'Dealership Applications', 'delete');
+  const canExport = hasActionPermission('dealership', 'Dealership Applications', 'export');
+  const canAssign = hasActionPermission('dealership', 'Assign/Unassign', 'assign');
+  const canUnassign = hasActionPermission('dealership', 'Assign/Unassign', 'unassign');
+  const canCopyLink = hasActionPermission('dealership', 'Public Form Link', 'send');
+  const canEmail = hasActionPermission('dealership', 'Confirmation Emails', 'send');
 
   const [form, setForm] = useState({
     salutation: 'Mr.',
@@ -84,12 +91,12 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   const assignBtnRefs = useRef<Record<number, HTMLButtonElement | null>>({});
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!canAssign) return;
     api
       .listStaff()
       .then((res) => setDealers(res.data.filter((s) => s.user_type === 'Dealer')))
       .catch(() => undefined);
-  }, [isAdmin]);
+  }, [canAssign]);
 
   const cityOptions = useMemo(() => citiesForProvince(form.province), [form.province]);
 
@@ -115,6 +122,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   }, [load]);
 
   const submit = async () => {
+    if (!canAdd) return onNotify('You do not have permission to add dealership applications');
     if (!form.firstName.trim() || !form.lastName.trim()) return onNotify('First and last name are required');
     if (!form.email.trim()) return onNotify('Email is required');
     if (!form.phone.trim()) return onNotify('Phone is required');
@@ -145,10 +153,11 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
 
       // Send confirmation email to applicant
       const refCode = res.data?.code || '';
-      sendSmtpEmail({
-        to: [form.email.trim()],
-        subject: `Dealership Application ${refCode} Received — Yadea Pakistan`,
-        html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+      if (canEmail) {
+        sendSmtpEmail({
+          to: [form.email.trim()],
+          subject: `Dealership Application ${refCode} Received — Yadea Pakistan`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
           <h2 style="color:#12161a;">Thank You for Your Dealership Application</h2>
           <p>Dear ${form.salutation} ${form.firstName.trim()} ${form.lastName.trim()},</p>
           <p>We have received your dealership application. Our team will review it and get back to you soon.</p>
@@ -161,7 +170,8 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
           <p>If you have any questions, please don't hesitate to reach out.</p>
           <p style="color:#64748b;font-size:12px;margin-top:24px;">Yadea Pakistan — Driving Sustainable Mobility Forward</p>
         </div>`,
-      }).catch(() => undefined);
+        }).catch(() => undefined);
+      }
       setForm((prev) => ({
         ...prev,
         firstName: '', lastName: '', email: '', phone: '', businessName: '', address: '',
@@ -178,7 +188,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   };
 
   const removeRow = async (row: ApiPortalSubmission) => {
-    if (!isAdmin) return onNotify('Only admins can delete records');
+    if (!canDelete) return onNotify('You do not have permission to delete dealership applications');
     if (!window.confirm(`Delete application ${row.code}?`)) return;
     try {
       await api.deletePortalSubmission(row.id);
@@ -196,6 +206,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   };
 
   const assign = async (row: ApiPortalSubmission) => {
+    if (!canAssign) return onNotify('You do not have permission to assign applications');
     const dealerId = assignPick[row.id];
     if (!dealerId) return onNotify('Pick a dealer first');
     try {
@@ -211,6 +222,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   };
 
   const unassign = async (row: ApiPortalSubmission) => {
+    if (!canUnassign) return onNotify('You do not have permission to unassign applications');
     try {
       await api.assignPortalSubmission(row.id, 0);
       onNotify(`Assignment removed from ${row.code}`);
@@ -221,6 +233,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   };
 
   const exportCsv = () => {
+    if (!canExport) return onNotify('You do not have permission to export applications');
     if (rows.length === 0) return onNotify('Nothing to export yet');
     let csv = 'Code,Name,Business,Email,Phone,City,Province,OEM,Years,Property,Structure,File,Assigned To,Submitted\n';
     rows.forEach((r) => {
@@ -266,6 +279,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
 
       <div className="max-w-5xl mx-auto px-3 md:px-6 -mt-10 pb-10 relative z-10 space-y-6">
         {/* Application form */}
+        {canAdd && (
         <div className="bg-white rounded-2xl shadow-xl p-5 md:p-8 border border-slate-100">
           <h3 className="text-xl font-bold text-slate-900 uppercase tracking-wide text-center mb-6">
             Dealership Application
@@ -402,8 +416,16 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
             </div>
           </div>
         </div>
+        )}
 
         {/* Received applications */}
+        {!canView ? (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 text-center">
+          <p className="text-xs text-slate-500">
+            You don't have permission to view dealership applications. Ask an administrator to enable it.
+          </p>
+        </div>
+        ) : (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
           <div className="p-4 border-b border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-3">
             <span className="text-sm font-bold text-slate-700 flex items-center gap-2">
@@ -417,6 +439,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
                 placeholder="Search applications…"
                 className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-yadea-orange w-44"
               />
+              {canCopyLink && (
               <button
                 onClick={() => void copyFormLink()}
                 className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5"
@@ -424,9 +447,12 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
               >
                 <FaLink className="text-[10px]" /> Copy Form Link
               </button>
+              )}
+              {canExport && (
               <button onClick={exportCsv} className="text-xs bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5">
                 <FaDownload className="text-[10px]" /> Export CSV
               </button>
+              )}
             </div>
           </div>
 
@@ -469,7 +495,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
                       <td className="px-4 py-3 text-slate-400 text-[11px]">{fmtDate(r.created_at)}</td>
                       <td className="px-4 py-3 text-right whitespace-nowrap">
                         <div className="relative inline-block text-left space-x-1.5">
-                          {isAdmin && (
+                          {canAssign && (
                             <button
                               ref={(el) => {
                                 assignBtnRefs.current[r.id] = el;
@@ -489,14 +515,14 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
                           <button onClick={() => setViewing(r)} className="text-slate-600 hover:text-yadea-orange text-[11px] font-bold px-2 py-1 bg-slate-100 rounded hover:bg-orange-50 transition">
                             View
                           </button>
-                          {isAdmin && (
+                          {canDelete && (
                             <button onClick={() => void removeRow(r)} className="text-red-500 hover:text-red-700 text-[11px] px-2 py-1 bg-red-50 rounded hover:bg-red-100 transition">
                               <FaRegTrashCan />
                             </button>
                           )}
 
                           <AnchoredPopover
-                            open={isAdmin && openAssign === r.id}
+                            open={canAssign && openAssign === r.id}
                             anchorEl={assignBtnRefs.current[r.id] ?? null}
                             onClose={() => setOpenAssign(null)}
                             placement="bottom-end"
@@ -523,7 +549,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
                               >
                                 Assign & Notify
                               </button>
-                              {r.assigned_to && (
+                              {r.assigned_to && canUnassign && (
                                 <button
                                   onClick={() => void unassign(r)}
                                   className="flex-1 bg-slate-100 hover:bg-red-50 text-slate-600 hover:text-red-600 text-[11px] font-bold py-1.5 rounded-md transition"
@@ -542,6 +568,7 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
             </table>
           </div>
         </div>
+        )}
       </div>
 
       {/* Details modal */}

@@ -61,8 +61,8 @@ const secondaryNav: NavItem[] = [
   { label: 'Media Storage', icon: FaRegFolderClosed, perm: 'medias' },
   { label: 'Reputation', icon: FaRegStar, perm: 'reputations' },
   { label: 'Reporting', icon: FaChartLine, perm: 'dashboard' },
-  { label: 'Dealership Page', icon: FaStore, perm: 'dashboard' },
-  { label: 'Customer Inquiries', icon: FaHeadset, perm: 'dashboard' },
+  { label: 'Dealership Page', icon: FaStore, perm: 'dealership' },
+  { label: 'Customer Inquiries', icon: FaHeadset, perm: 'inquiries' },
   { label: 'App Marketplace', icon: FaGrip, perm: 'integrations' },
 ];
 

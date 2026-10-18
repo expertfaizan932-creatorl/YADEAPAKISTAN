@@ -64,6 +64,8 @@ import {
   FaMoneyBillTransfer,
   FaUserGear,
   FaWordpress,
+  FaStore,
+  FaHeadset,
 } from 'react-icons/fa6';
 import { useStaff } from '../StaffContext';
 import { useAuth } from '../auth';
@@ -119,6 +121,8 @@ const ICON_MAP: Record<string, IconType> = {
   'money-bill-transfer': FaMoneyBillTransfer,
   'user-gear': FaUserGear,
   wordpress: FaWordpress,
+  store: FaStore,
+  headset: FaHeadset,
 };
 
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
