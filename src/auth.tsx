@@ -49,8 +49,9 @@ interface AuthContextValue {
    */
   updateUser: (changes: StaffInput) => Promise<ApiStaffUser>;
   /**
-   * True for Admins, or when at least one permission under the given
-   * permission category id (e.g. 'contacts', 'conversations') is enabled.
+   * True when at least one permission under the given permission category id
+   * (e.g. 'contacts', 'conversations') is enabled. Admins pass automatically
+   * unless their account carries an explicit (restricted) permissions map.
    */
   hasPermission: (categoryId: string) => boolean;
   /** True only when the exact "category:item" permission is enabled. */
@@ -58,12 +59,12 @@ interface AuthContextValue {
   /**
    * True only when the exact granular action key is enabled, e.g.
    * `hasActionPermission('contacts', 'Contacts', 'delete')` -> `contacts:Contacts:delete`.
-   * Admins always pass.
+   * Admins pass unless their account carries an explicit permissions map.
    */
   hasActionPermission: (categoryId: string, label: string, action: string) => boolean;
   /**
-   * True for Admins, or when at least one "edit" permission under the given
-   * category is enabled. Used to gate mutating actions (add/edit/delete).
+   * True when at least one "edit" permission under the given category is
+   * enabled. Used to gate mutating actions (add/edit/delete).
    */
   hasEditPermission: (categoryId: string) => boolean;
 }
@@ -109,6 +110,18 @@ function readStored(key: string): StoredSession | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * An Admin account normally holds every permission. As soon as an explicit
+ * permissions map has been saved on that account (Settings -> My Staff ->
+ * Roles & Permissions), those toggles apply to the Admin too — so an Admin can
+ * be given a restricted scope (e.g. no Dealership Page). Admins whose saved
+ * permissions are empty/null (seeded accounts, created before this rule) keep
+ * unrestricted access.
+ */
+function adminHasExplicitPerms(u: ApiStaffUser): boolean {
+  return Object.keys(u.permissions ?? {}).length > 0;
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -275,7 +288,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const hasPermission = useCallback(
     (categoryId: string): boolean => {
       if (!user) return false;
-      if (user.user_type === 'Admin') return true;
+      if (user.user_type === 'Admin' && !adminHasExplicitPerms(user)) return true;
       const perms = user.permissions ?? {};
       return Object.keys(perms).some(
         (k) => k.startsWith(`${categoryId}:`) && perms[k] === true
@@ -287,7 +300,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const hasExactPermission = useCallback(
     (key: string): boolean => {
       if (!user) return false;
-      if (user.user_type === 'Admin') return true;
+      if (user.user_type === 'Admin' && !adminHasExplicitPerms(user)) return true;
       return (user.permissions ?? {})[key] === true;
     },
     [user]
@@ -296,7 +309,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const hasActionPermission = useCallback(
     (categoryId: string, label: string, action: string): boolean => {
       if (!user) return false;
-      if (user.user_type === 'Admin') return true;
+      if (user.user_type === 'Admin' && !adminHasExplicitPerms(user)) return true;
       return (user.permissions ?? {})[`${categoryId}:${label}:${action}`] === true;
     },
     [user]
@@ -305,7 +318,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const hasEditPermission = useCallback(
     (categoryId: string): boolean => {
       if (!user) return false;
-      if (user.user_type === 'Admin') return true;
+      if (user.user_type === 'Admin' && !adminHasExplicitPerms(user)) return true;
       const perms = user.permissions ?? {};
       return Object.keys(perms).some(
         (k) => k.startsWith(`${categoryId}:`) && k.endsWith(':edit') && perms[k] === true

@@ -87,7 +87,7 @@ function Sidebar({
 }: SidebarProps) {
   const widthClass = collapsed ? 'w-16' : 'w-64';
   const { user, hasPermission } = useAuth();
-  const canManageStaff = user?.user_type === 'Admin' || hasPermission('user_management');
+  const canManageStaff = hasPermission('user_management');
 
   const visiblePrimary = primaryNav.filter((item) => !item.perm || hasPermission(item.perm));
   const visibleSecondary = secondaryNav.filter((item) => !item.perm || hasPermission(item.perm));

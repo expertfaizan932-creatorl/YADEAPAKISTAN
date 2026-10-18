@@ -1722,15 +1722,17 @@ function current_user_id(): int
 
 /**
  * True when the caller holds a granular permission key such as
- * `dealership:Assign/Unassign:assign`. Admins hold every key; everyone else
- * gets exactly what their staff row's permissions JSON says.
+ * `dealership:Assign/Unassign:assign`. An Admin holds every key — unless an
+ * explicit permissions map was saved on their account, in which case those
+ * toggles scope the Admin too. Everyone else gets exactly what their staff
+ * row's permissions JSON says.
  */
 function api_user_can(string $catId, string $label, string $action): bool
 {
     $user = api_current_user();
     if ($user === null) return false;
-    if (($user['user_type'] ?? '') === 'Admin') return true;
     $perms = decode_json_field($user['permissions'] ?? null);
+    if (($user['user_type'] ?? '') === 'Admin' && !$perms) return true;
     return !empty($perms[$catId . ':' . $label . ':' . $action]);
 }
 
