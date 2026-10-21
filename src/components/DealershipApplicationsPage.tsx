@@ -13,8 +13,18 @@ import {
 import { api, type ApiPortalSubmission, type ApiStaffUser } from '../api';
 import { useAuth } from '../auth';
 import { PROVINCES, citiesForProvince } from '../data/pakistanCities';
+import {
+  countByDateFilter,
+  countByStatusFilter,
+  downloadCsv,
+  filterSubmissions,
+  todayYmd,
+  type SubmissionDateFilter,
+  type SubmissionStatusFilter,
+} from '../data/submissionFilters';
 import { sendSmtpEmail } from '../services/smtp';
 import AnchoredPopover from './AnchoredPopover';
+import SubmissionFilterBar from './SubmissionFilterBar';
 
 interface PageProps {
   onNotify: (msg: string) => void;
@@ -84,11 +94,17 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
   const [rows, setRows] = useState<ApiPortalSubmission[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<SubmissionStatusFilter>('all');
+  const [dateFilter, setDateFilter] = useState<SubmissionDateFilter>('all');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [viewing, setViewing] = useState<ApiPortalSubmission | null>(null);
   const [dealers, setDealers] = useState<ApiStaffUser[]>([]);
   const [assignPick, setAssignPick] = useState<Record<number, number>>({});
   const [openAssign, setOpenAssign] = useState<number | null>(null);
   const assignBtnRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!canAssign) return;
@@ -232,32 +248,68 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
     }
   };
 
-  const exportCsv = () => {
+  const exportCsv = (list: ApiPortalSubmission[], filename: string) => {
     if (!canExport) return onNotify('You do not have permission to export applications');
-    if (rows.length === 0) return onNotify('Nothing to export yet');
-    let csv = 'Code,Name,Business,Email,Phone,City,Province,OEM,Years,Property,Structure,File,Assigned To,Submitted\n';
-    rows.forEach((r) => {
-      csv += `"${r.code}","${r.name}","${r.business_name}","${r.email}","${r.phone}","${r.city}","${r.province}","${r.oem_dealer}","${r.years_in_business}","${r.property_ownership}","${r.structure}","${r.file_name}","${r.assigned_to_name ?? ''}","${fmtDate(r.created_at)}"\n`;
-    });
-    const link = document.createElement('a');
-    link.href = `data:text/csv;charset=utf-8,${encodeURI(csv)}`;
-    link.download = 'yadea_dealership_applications.csv';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    onNotify('CSV exported');
+    if (list.length === 0) return onNotify('Nothing to export yet');
+    downloadCsv(
+      filename,
+      ['Code', 'Name', 'Business', 'Email', 'Phone', 'City', 'Province', 'OEM', 'Years', 'Property', 'Structure', 'File', 'Status', 'Assigned To', 'Submitted'],
+      list.map((r) => [
+        r.code,
+        r.name,
+        r.business_name,
+        r.email,
+        r.phone,
+        r.city,
+        r.province,
+        r.oem_dealer,
+        r.years_in_business,
+        r.property_ownership,
+        r.structure,
+        r.file_name,
+        r.status,
+        r.assigned_to_name ?? '',
+        fmtDate(r.created_at),
+      ])
+    );
+    onNotify(`CSV exported — ${list.length} application${list.length === 1 ? '' : 's'}`);
   };
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter((r) =>
+    const byFilter = filterSubmissions(rows, statusFilter, dateFilter, customFrom, customTo);
+    if (!q) return byFilter;
+    return byFilter.filter((r) =>
       [r.code, r.name, r.business_name, r.email, r.phone, r.city, r.province]
         .join(' ')
         .toLowerCase()
         .includes(q)
     );
-  }, [rows, search]);
+  }, [rows, search, statusFilter, dateFilter, customFrom, customTo]);
+
+  const selectedRows = useMemo(
+    () => filtered.filter((r) => selectedIds.includes(r.id)),
+    [filtered, selectedIds]
+  );
+
+  const statusCounts = useMemo(() => countByStatusFilter(rows), [rows]);
+  const dateCounts = useMemo(() => countByDateFilter(rows), [rows]);
+
+  const toggleRow = (id: number) =>
+    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  const toggleSelectAll = () => {
+    const visible = filtered.map((r) => r.id);
+    const allSelected = visible.length > 0 && visible.every((id) => selectedIds.includes(id));
+    setSelectedIds((prev) =>
+      allSelected ? prev.filter((id) => !visible.includes(id)) : Array.from(new Set([...prev, ...visible]))
+    );
+  };
+
+  useEffect(() => {
+    if (!selectAllRef.current) return;
+    selectAllRef.current.indeterminate = selectedRows.length > 0 && selectedRows.length < filtered.length;
+  }, [selectedRows.length, filtered.length]);
 
   return (
     <div className="min-h-full bg-slate-100">
@@ -427,32 +479,73 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
         </div>
         ) : (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-          <div className="p-4 border-b border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-3">
-            <span className="text-sm font-bold text-slate-700 flex items-center gap-2">
-              <FaStore className="text-yadea-orange" /> Received Applications
-              <span className="bg-slate-200 text-slate-600 text-[10px] px-2 py-0.5 rounded-full">{rows.length}</span>
-            </span>
-            <div className="flex items-center gap-2">
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search applications…"
-                className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-yadea-orange w-44"
-              />
-              {canCopyLink && (
-              <button
-                onClick={() => void copyFormLink()}
-                className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5"
-                title="Copy the public link for this form"
-              >
-                <FaLink className="text-[10px]" /> Copy Form Link
-              </button>
-              )}
-              {canExport && (
-              <button onClick={exportCsv} className="text-xs bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5">
-                <FaDownload className="text-[10px]" /> Export CSV
-              </button>
-              )}
+          <div className="p-4 border-b border-slate-200 bg-slate-50 space-y-3">
+            <SubmissionFilterBar
+              status={statusFilter}
+              onStatusChange={setStatusFilter}
+              date={dateFilter}
+              onDateChange={(v) => {
+                setDateFilter(v);
+                if (v === 'custom' && !customFrom && !customTo) {
+                  const t = todayYmd();
+                  setCustomFrom(t);
+                  setCustomTo(t);
+                }
+              }}
+              customFrom={customFrom}
+              customTo={customTo}
+              onCustomChange={(from, to) => {
+                setCustomFrom(from);
+                setCustomTo(to);
+              }}
+              statusCounts={statusCounts}
+              dateCounts={dateCounts}
+            />
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                <FaStore className="text-yadea-orange" />
+                <span className="text-sm font-bold text-slate-700">Received Applications</span>
+                <span className="bg-slate-200 text-slate-600 text-[10px] px-2 py-0.5 rounded-full">{rows.length}</span>
+                {selectedRows.length > 0 && (
+                  <>
+                    <span className="w-px h-3 bg-slate-300" />
+                    <span className="font-bold text-yadea-orange">{selectedRows.length} selected</span>
+                    <button
+                      onClick={() => setSelectedIds([])}
+                      className="font-bold text-slate-400 hover:text-yadea-orange transition"
+                    >
+                      Clear
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search applications…"
+                  className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-yadea-orange w-44"
+                />
+                {canCopyLink && (
+                <button
+                  onClick={() => void copyFormLink()}
+                  className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5"
+                  title="Copy the public link for this form"
+                >
+                  <FaLink className="text-[10px]" /> Copy Form Link
+                </button>
+                )}
+                {canExport && (
+                <button
+                  onClick={() => exportCsv(selectedRows.length ? selectedRows : filtered, 'yadea_dealership_applications.csv')}
+                  className="text-xs bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5"
+                  title="Export the selected applications (or every filtered one)"
+                >
+                  <FaDownload className="text-[10px]" />
+                  {selectedRows.length ? `Export Selected (${selectedRows.length})` : 'Export CSV'}
+                </button>
+                )}
+              </div>
             </div>
           </div>
 
@@ -460,6 +553,16 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
             <table className="w-full text-left text-xs text-slate-600">
               <thead className="bg-slate-100 text-slate-700 uppercase font-semibold border-b border-slate-200">
                 <tr>
+                  <th className="px-3 py-3 w-10">
+                    <input
+                      ref={selectAllRef}
+                      type="checkbox"
+                      checked={filtered.length > 0 && selectedRows.length === filtered.length}
+                      onChange={toggleSelectAll}
+                      className="w-4 h-4 accent-yadea-orange cursor-pointer"
+                      title="Select all shown applications"
+                    />
+                  </th>
                   <th className="px-4 py-3">Code</th>
                   <th className="px-4 py-3">Applicant / Business</th>
                   <th className="px-4 py-3">Contact</th>
@@ -470,12 +573,26 @@ function DealershipApplicationsPage({ onNotify }: PageProps) {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {loading ? (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-400">Loading…</td></tr>
+                  <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">Loading…</td></tr>
                 ) : filtered.length === 0 ? (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-400 font-medium">No applications yet.</td></tr>
+                  <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400 font-medium">No applications yet.</td></tr>
                 ) : (
                   filtered.map((r) => (
-                    <tr key={r.id} className="hover:bg-slate-50 transition">
+                    <tr
+                      key={r.id}
+                      className={`hover:bg-slate-50 transition ${
+                        selectedIds.includes(r.id) ? 'bg-orange-50/60' : ''
+                      }`}
+                    >
+                      <td className="px-3 py-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.includes(r.id)}
+                          onChange={() => toggleRow(r.id)}
+                          className="w-4 h-4 accent-yadea-orange cursor-pointer"
+                          title={`Select application ${r.code}`}
+                        />
+                      </td>
                       <td className="px-4 py-3 font-mono font-bold text-yadea-dark">{r.code}</td>
                       <td className="px-4 py-3">
                         <div className="font-semibold text-slate-800">{r.name}</div>
